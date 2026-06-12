@@ -208,44 +208,147 @@ def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
 
 # ── 第四步：上传音频 ──────────────────────────────────────────
 
-def upload_audio(filepath: str) -> str:
-    log(f"☁️  上传音频：{os.path.basename(filepath)}...")
-
-    # 方案1: 0x0.st
-    try:
-        with open(filepath, "rb") as f:
-            resp = requests.post(
-                "https://0x0.st",
-                files={"file": f},
-                timeout=120,
-            )
-        if resp.status_code == 200 and resp.text.strip().startswith("http"):
-            url = resp.text.strip()
-            log(f"  ✓ 上传成功：{url}")
-            return url
-    except Exception as e:
-        log(f"  ⚠️ 0x0.st失败：{e}，尝试备用...")
-
-    # 方案2: file.io
-    try:
-        with open(filepath, "rb") as f:
-            resp = requests.post(
-                "https://file.io/?expires=1d",
-                files={"file": (os.path.basename(filepath), f, "audio/mpeg")},
-                timeout=120,
-            )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success"):
-                url = data["link"]
-                log(f"  ✓ 上传成功（备用）：{url}")
-                return url
-    except Exception as e:
-        log(f"  ⚠️ file.io失败：{e}")
-
-    raise RuntimeError(f"所有上传方案均失败：{filepath}")
+def upload_to_twilio(filepath: str) -> str:
+    """上传音频到Twilio媒体库，返回URL"""
+    log(f"☁️  上传音频到Twilio：{os.path.basename(filepath)}...")
+    from twilio.rest import Client as TwilioClient
+    tc = TwilioClient(
+        os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID,
+        os.environ.get("TWILIO_AUTH_TOKEN") or config.TWILIO_AUTH_TOKEN,
+    )
+    with open(filepath, "rb") as f:
+        media = tc.media.v1.media_processor.list()
+    # 用requests直接上传到Twilio Assets
+    import base64
+    sid = os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID
+    token = os.environ.get("TWILIO_AUTH_TOKEN") or config.TWILIO_AUTH_TOKEN
+    with open(filepath, "rb") as f:
+        audio_data = f.read()
+    resp = requests.post(
+        f"https://mcs.us1.twilio.com/v1/Services",
+        auth=(sid, token),
+        json={"FriendlyName": os.path.basename(filepath)},
+        timeout=30,
+    )
+    service_sid = resp.json().get("sid", "")
+    resp2 = requests.post(
+        f"https://mcs.us1.twilio.com/v1/Services/{service_sid}/Assets",
+        auth=(sid, token),
+        data={"FriendlyName": os.path.basename(filepath), "Visibility": "public"},
+        timeout=30,
+    )
+    asset_sid = resp2.json().get("sid", "")
+    resp3 = requests.post(
+        f"https://mcs.us1.twilio.com/v1/Services/{service_sid}/Assets/{asset_sid}/Versions",
+        auth=(sid, token),
+        files={"Content": (os.path.basename(filepath), open(filepath,"rb"), "audio/mpeg")},
+        data={"Path": f"/{os.path.basename(filepath)}", "Visibility": "public"},
+        timeout=120,
+    )
+    url = f"https://mcs.us1.twilio.com/v1/Services/{service_sid}/Assets/{asset_sid}/Versions/{resp3.json().get('sid','')}"
+    log(f"  ✓ 上传成功")
+    return url
 
 # ── 第五步：发送到WhatsApp ────────────────────────────────────
+
+
+def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file):
+    """直接用Twilio发送音频文件（无需上传到第三方）"""
+    from twilio.rest import Client as TC
+    import base64
+
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID
+    auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")  or config.TWILIO_AUTH_TOKEN
+    recipients  = config.WHATSAPP_RECIPIENTS
+    from_num    = config.TWILIO_WHATSAPP_FROM
+    date        = today_str()
+
+    client = TC(account_sid, auth_token)
+
+    # 文字摘要
+    summary_lines = []
+    for line in broadcast_text.split("\n"):
+        line = line.strip()
+        if line.startswith("【") and line.endswith("】"):
+            summary_lines.append(line)
+        if len(summary_lines) >= 6:
+            break
+
+    text_msg = (
+        f"🔵 *小蓝人播报* · {date}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{chr(10).join(summary_lines)}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"👇 语音版：先听预告，再听全文"
+    )
+
+    # 上传文件到Twilio
+    def twilio_upload(fpath):
+        fname = os.path.basename(fpath)
+        with open(fpath, "rb") as f:
+            resp = requests.post(
+                f"https://mcs.us1.twilio.com/v1/Services",
+                auth=(account_sid, auth_token),
+                json={"FriendlyName": fname},
+                timeout=30,
+            )
+        svc_sid = resp.json().get("sid","")
+        resp2 = requests.post(
+            f"https://mcs.us1.twilio.com/v1/Services/{svc_sid}/Assets",
+            auth=(account_sid, auth_token),
+            data={"FriendlyName": fname, "Visibility": "public"},
+            timeout=30,
+        )
+        ast_sid = resp2.json().get("sid","")
+        with open(fpath, "rb") as f:
+            resp3 = requests.post(
+                f"https://mcs.us1.twilio.com/v1/Services/{svc_sid}/Assets/{ast_sid}/Versions",
+                auth=(account_sid, auth_token),
+                files={"Content": (fname, f, "audio/mpeg")},
+                data={"Path": f"/{fname}", "Visibility": "public"},
+                timeout=180,
+            )
+        ver_sid = resp3.json().get("sid","")
+        # 部署
+        requests.post(
+            f"https://serverless.twilio.com/v1/Services/{svc_sid}/Environments",
+            auth=(account_sid, auth_token),
+            data={"UniqueName": "production", "DomainSuffix": "prod"},
+            timeout=30,
+        )
+        url = f"https://{svc_sid}-prod.twil.io/{fname}"
+        return url
+
+    log("  📤 上传预告音频到Twilio...")
+    try:
+        preview_url = twilio_upload(preview_file)
+        log(f"  ✓ 预告URL: {preview_url}")
+    except Exception as e:
+        log(f"  ⚠️ Twilio上传失败: {e}")
+        preview_url = None
+
+    log("  📤 上传正文音频到Twilio...")
+    try:
+        broadcast_url = twilio_upload(broadcast_file)
+        log(f"  ✓ 正文URL: {broadcast_url}")
+    except Exception as e:
+        log(f"  ⚠️ Twilio上传失败: {e}")
+        broadcast_url = None
+
+    for recipient in recipients:
+        try:
+            client.messages.create(from_=from_num, to=recipient, body=text_msg)
+            time.sleep(1)
+            if preview_url:
+                client.messages.create(from_=from_num, to=recipient,
+                    body="🎙️ 今日预告（30秒）", media_url=[preview_url])
+                time.sleep(1)
+            if broadcast_url:
+                client.messages.create(from_=from_num, to=recipient,
+                    body="📻 完整播报（7-10分钟）", media_url=[broadcast_url])
+            log(f"  ✓ 已发送至 {recipient}")
+        except Exception as e:
+            log(f"  ✗ 发送失败 {recipient}: {e}")
 
 def send_whatsapp(preview_text, broadcast_text, preview_audio_url, broadcast_audio_url):
     client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
@@ -321,11 +424,8 @@ def main():
 
         preview_file, broadcast_file = synthesize_audio(preview_text, broadcast_text)
 
-        preview_url   = upload_audio(preview_file)
-        broadcast_url = upload_audio(broadcast_file)
-
         log("📱 发送WhatsApp消息...")
-        send_whatsapp(preview_text, broadcast_text, preview_url, broadcast_url)
+        send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file)
 
         elapsed = int(time.time() - start)
         log("=" * 50)
