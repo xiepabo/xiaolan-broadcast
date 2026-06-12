@@ -282,57 +282,47 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
         f"👇 语音版：先听预告，再听全文"
     )
 
-    # 上传文件到Twilio
-    def twilio_upload(fpath):
+    # 上传音频到 Cloudinary（免费CDN，Twilio兼容）
+    def cloudinary_upload(fpath):
         fname = os.path.basename(fpath)
+        cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME") or config.CLOUDINARY_CLOUD_NAME
+        api_key    = os.environ.get("CLOUDINARY_API_KEY")    or config.CLOUDINARY_API_KEY
+        api_secret = os.environ.get("CLOUDINARY_API_SECRET") or config.CLOUDINARY_API_SECRET
+        import hashlib, time as t
+        timestamp = str(int(t.time()))
+        sig_str = f"public_id={fname}&timestamp={timestamp}{api_secret}"
+        signature = hashlib.sha1(sig_str.encode()).hexdigest()
         with open(fpath, "rb") as f:
             resp = requests.post(
-                f"https://mcs.us1.twilio.com/v1/Services",
-                auth=(account_sid, auth_token),
-                json={"FriendlyName": fname},
-                timeout=30,
-            )
-        svc_sid = resp.json().get("sid","")
-        resp2 = requests.post(
-            f"https://mcs.us1.twilio.com/v1/Services/{svc_sid}/Assets",
-            auth=(account_sid, auth_token),
-            data={"FriendlyName": fname, "Visibility": "public"},
-            timeout=30,
-        )
-        ast_sid = resp2.json().get("sid","")
-        with open(fpath, "rb") as f:
-            resp3 = requests.post(
-                f"https://mcs.us1.twilio.com/v1/Services/{svc_sid}/Assets/{ast_sid}/Versions",
-                auth=(account_sid, auth_token),
-                files={"Content": (fname, f, "audio/mpeg")},
-                data={"Path": f"/{fname}", "Visibility": "public"},
+                f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
+                data={
+                    "api_key": api_key,
+                    "timestamp": timestamp,
+                    "signature": signature,
+                    "public_id": fname.replace(".mp3",""),
+                    "resource_type": "video",
+                },
+                files={"file": f},
                 timeout=180,
             )
-        ver_sid = resp3.json().get("sid","")
-        # 部署
-        requests.post(
-            f"https://serverless.twilio.com/v1/Services/{svc_sid}/Environments",
-            auth=(account_sid, auth_token),
-            data={"UniqueName": "production", "DomainSuffix": "prod"},
-            timeout=30,
-        )
-        url = f"https://{svc_sid}-prod.twil.io/{fname}"
+        data = resp.json()
+        url = data.get("secure_url","")
         return url
 
-    log("  📤 上传预告音频到Twilio...")
+    log("  📤 上传预告音频到Cloudinary...")
     try:
-        preview_url = twilio_upload(preview_file)
+        preview_url = cloudinary_upload(preview_file)
         log(f"  ✓ 预告URL: {preview_url}")
     except Exception as e:
-        log(f"  ⚠️ Twilio上传失败: {e}")
+        log(f"  ⚠️ 上传失败: {e}")
         preview_url = None
 
-    log("  📤 上传正文音频到Twilio...")
+    log("  📤 上传正文音频到Cloudinary...")
     try:
-        broadcast_url = twilio_upload(broadcast_file)
+        broadcast_url = cloudinary_upload(broadcast_file)
         log(f"  ✓ 正文URL: {broadcast_url}")
     except Exception as e:
-        log(f"  ⚠️ Twilio上传失败: {e}")
+        log(f"  ⚠️ 上传失败: {e}")
         broadcast_url = None
 
     for recipient in recipients:
