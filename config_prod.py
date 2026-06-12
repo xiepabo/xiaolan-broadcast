@@ -53,3 +53,8 @@ TARGET_DURATION_MAX  = 10
 COMPANY_NAME         = "中建中东投资"
 
 OUTPUT_DIR = "output"
+
+# Cloudinary（免费媒体CDN，用于WhatsApp语音发送）
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
