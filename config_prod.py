@@ -24,7 +24,7 @@ VOICE_SPEAKER_BOOST  = True
 # Twilio
 TWILIO_ACCOUNT_SID   = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN    = os.environ.get("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886"
+TWILIO_WHATSAPP_FROM = "whatsapp:+8615605015539"
 
 # 收件人：从环境变量读取JSON数组
 # 格式: ["whatsapp:+971XXXXXXXX","whatsapp:+971XXXXXXXX"]
