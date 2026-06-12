@@ -2,11 +2,11 @@ name: 小蓝人每日播报
 
 on:
   schedule:
-    # 迪拜时间 17:30 = UTC 13:30
-    - cron: '30 13 * * 1-5'   # 周一到周五
-    # 如需周末也播报，改为：
-    # - cron: '30 13 * * *'
-  workflow_dispatch:            # 允许手动触发（测试用）
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   broadcast:
@@ -32,6 +32,8 @@ jobs:
           TWILIO_ACCOUNT_SID:   ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN:    ${{ secrets.TWILIO_AUTH_TOKEN }}
           WHATSAPP_RECIPIENTS:  ${{ secrets.WHATSAPP_RECIPIENTS }}
+          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:    ${{ github.repository }}
         run: python main.py
 
       - name: 上传播报文本备份
