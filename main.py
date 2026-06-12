@@ -210,20 +210,40 @@ def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
 
 def upload_audio(filepath: str) -> str:
     log(f"☁️  上传音频：{os.path.basename(filepath)}...")
-    with open(filepath, "rb") as f:
-        resp = requests.post(
-            "https://file.io",
-            files={"file": f},
-            data={"expires": "1d", "autoDelete": "true"},
-            timeout=60,
-        )
-    data = resp.json()
-    if data.get("success"):
-        url = data["link"]
-        log(f"  ✓ 上传成功：{url}")
-        return url
-    else:
-        raise RuntimeError(f"文件上传失败：{data}")
+
+    # 方案1: 0x0.st
+    try:
+        with open(filepath, "rb") as f:
+            resp = requests.post(
+                "https://0x0.st",
+                files={"file": f},
+                timeout=120,
+            )
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            url = resp.text.strip()
+            log(f"  ✓ 上传成功：{url}")
+            return url
+    except Exception as e:
+        log(f"  ⚠️ 0x0.st失败：{e}，尝试备用...")
+
+    # 方案2: file.io
+    try:
+        with open(filepath, "rb") as f:
+            resp = requests.post(
+                "https://file.io/?expires=1d",
+                files={"file": (os.path.basename(filepath), f, "audio/mpeg")},
+                timeout=120,
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                url = data["link"]
+                log(f"  ✓ 上传成功（备用）：{url}")
+                return url
+    except Exception as e:
+        log(f"  ⚠️ file.io失败：{e}")
+
+    raise RuntimeError(f"所有上传方案均失败：{filepath}")
 
 # ── 第五步：发送到WhatsApp ────────────────────────────────────
 
