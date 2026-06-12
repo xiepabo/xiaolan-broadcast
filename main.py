@@ -20,8 +20,7 @@ import requests
 import feedparser
 from pathlib import Path
 from anthropic import Anthropic
-from elevenlabs.client import ElevenLabs
-from elevenlabs import save
+from elevenlabs import ElevenLabs, VoiceSettings
 from twilio.rest import Client
 
 # 加载配置
