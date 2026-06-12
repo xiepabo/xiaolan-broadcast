@@ -150,7 +150,7 @@ def generate_scripts(articles: list) -> tuple:
 
 def text_to_speech(text: str, filename: str) -> str:
     log(f"🎙️  OpenAI TTS合成语音：{filename}...")
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or config.OPENAI_API_KEY)
 
     # 超过4096字符需要分段
     MAX_CHARS = 4000
