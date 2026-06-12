@@ -356,15 +356,16 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
 
     for recipient in recipients:
         try:
-            client.messages.create(from_=from_num, to=recipient, body=text_msg)
-            time.sleep(1)
-            if preview_url:
-                client.messages.create(from_=from_num, to=recipient,
-                    body="🎙️ 今日预告（30秒）", media_url=[preview_url])
-                time.sleep(1)
-            if broadcast_url:
-                client.messages.create(from_=from_num, to=recipient,
-                    body="📻 完整播报（7-10分钟）", media_url=[broadcast_url])
+            # 消息1：完整播报文字内容
+            # 取播报稿前1500字（WhatsApp单条消息限制）
+            broadcast_preview = broadcast_text[:1500] + "..." if len(broadcast_text) > 1500 else broadcast_text
+            client.messages.create(from_=from_num, to=recipient, body=broadcast_preview)
+            time.sleep(2)
+
+            # 消息2：语音链接
+            voice_msg = f"🎙️ *小蓝人语音播报*\n\n预告（30秒）：\n{preview_url}\n\n完整播报（约13分钟）：\n{broadcast_url}"
+            client.messages.create(from_=from_num, to=recipient, body=voice_msg)
+
             log(f"  ✓ 已发送至 {recipient}")
         except Exception as e:
             log(f"  ✗ 发送失败 {recipient}: {e}")
