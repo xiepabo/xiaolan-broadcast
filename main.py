@@ -356,15 +356,43 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
 
     for recipient in recipients:
         try:
-            # 消息1：完整播报文字内容
-            # 取播报稿前1500字（WhatsApp单条消息限制）
-            broadcast_preview = broadcast_text[:1500] + "..." if len(broadcast_text) > 1500 else broadcast_text
-            client.messages.create(from_=from_num, to=recipient, body=broadcast_preview)
+            # 消息1：文字摘要
+            summary_lines = []
+            for line in broadcast_text.split("\n"):
+                line = line.strip()
+                if line.startswith("【") and "】" in line:
+                    summary_lines.append(line)
+                if len(summary_lines) >= 6:
+                    break
+            if not summary_lines:
+                summary_lines = [broadcast_text[:200] + "..."]
+
+            text_msg = (
+                f"🔵 *小蓝人播报* · {date}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{chr(10).join(summary_lines)}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"👇 语音版：先听预告，再听全文"
+            )
+            client.messages.create(from_=from_num, to=recipient, body=text_msg)
             time.sleep(2)
 
-            # 消息2：语音链接
-            voice_msg = f"🎙️ *小蓝人语音播报*\n\n预告（30秒）：\n{preview_url}\n\n完整播报（约13分钟）：\n{broadcast_url}"
-            client.messages.create(from_=from_num, to=recipient, body=voice_msg)
+            # 消息2：预告语音
+            if preview_url:
+                client.messages.create(
+                    from_=from_num, to=recipient,
+                    body="🎙️ 今日预告（30秒）",
+                    media_url=[preview_url]
+                )
+                time.sleep(2)
+
+            # 消息3：完整播报语音
+            if broadcast_url:
+                client.messages.create(
+                    from_=from_num, to=recipient,
+                    body="📻 完整播报（7-10分钟）",
+                    media_url=[broadcast_url]
+                )
 
             log(f"  ✓ 已发送至 {recipient}")
         except Exception as e:
