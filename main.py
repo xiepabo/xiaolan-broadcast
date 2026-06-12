@@ -282,47 +282,73 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
         f"👇 语音版：先听预告，再听全文"
     )
 
-    # 上传音频到 Cloudinary（免费CDN，Twilio兼容）
-    def cloudinary_upload(fpath):
+    # 上传音频到 GitHub Releases（稳定可靠，不需要第三方）
+    def github_upload(fpath):
+        import base64, hashlib
         fname = os.path.basename(fpath)
-        cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME") or config.CLOUDINARY_CLOUD_NAME
-        api_key    = os.environ.get("CLOUDINARY_API_KEY")    or config.CLOUDINARY_API_KEY
-        api_secret = os.environ.get("CLOUDINARY_API_SECRET") or config.CLOUDINARY_API_SECRET
-        import hashlib, time as t
-        timestamp = str(int(t.time()))
-        sig_str = f"public_id={fname}&timestamp={timestamp}{api_secret}"
-        signature = hashlib.sha1(sig_str.encode()).hexdigest()
+        gh_token = os.environ.get("GITHUB_TOKEN","")
+        gh_repo  = os.environ.get("GITHUB_REPOSITORY","")
+        
+        # 用GitHub API上传到release
+        # 先获取或创建release
+        headers = {
+            "Authorization": f"token {gh_token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        tag = f"audio-{datetime.date.today().strftime('%Y%m%d')}"
+        
+        # 创建release
+        rel_resp = requests.post(
+            f"https://api.github.com/repos/{gh_repo}/releases",
+            headers=headers,
+            json={"tag_name": tag, "name": f"播报音频 {tag}", "draft": False, "prerelease": False},
+            timeout=30,
+        )
+        if rel_resp.status_code == 422:
+            # release已存在，获取它
+            rel_resp = requests.get(
+                f"https://api.github.com/repos/{gh_repo}/releases/tags/{tag}",
+                headers=headers, timeout=30,
+            )
+        rel_data = rel_resp.json()
+        upload_url = rel_data.get("upload_url","").replace("{?name,label}","")
+        rel_id = rel_data.get("id","")
+        
+        # 删除同名旧asset
+        assets_resp = requests.get(
+            f"https://api.github.com/repos/{gh_repo}/releases/{rel_id}/assets",
+            headers=headers, timeout=30,
+        )
+        for asset in assets_resp.json():
+            if asset.get("name") == fname:
+                requests.delete(
+                    f"https://api.github.com/repos/{gh_repo}/releases/assets/{asset['id']}",
+                    headers=headers, timeout=30,
+                )
+        
+        # 上传文件
         with open(fpath, "rb") as f:
-            resp = requests.post(
-                f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
-                data={
-                    "api_key": api_key,
-                    "timestamp": timestamp,
-                    "signature": signature,
-                    "public_id": fname.replace(".mp3",""),
-                    "resource_type": "video",
-                },
-                files={"file": f},
+            up_resp = requests.post(
+                f"{upload_url}?name={fname}",
+                headers={**headers, "Content-Type": "audio/mpeg"},
+                data=f,
                 timeout=180,
             )
-        data = resp.json()
-        log(f"  Cloudinary响应: {list(data.keys())}")
-        url = data.get("secure_url") or data.get("url") or data.get("playback_url","")
-        if not url:
-            raise RuntimeError(f"Cloudinary未返回URL: {data}")
+        asset_data = up_resp.json()
+        url = asset_data.get("browser_download_url","")
         return url
 
-    log("  📤 上传预告音频到Cloudinary...")
+    log("  📤 上传预告音频到GitHub...")
     try:
-        preview_url = cloudinary_upload(preview_file)
+        preview_url = github_upload(preview_file)
         log(f"  ✓ 预告URL: {preview_url}")
     except Exception as e:
         log(f"  ⚠️ 上传失败: {e}")
         preview_url = None
 
-    log("  📤 上传正文音频到Cloudinary...")
+    log("  📤 上传正文音频到GitHub...")
     try:
-        broadcast_url = cloudinary_upload(broadcast_file)
+        broadcast_url = github_upload(broadcast_file)
         log(f"  ✓ 正文URL: {broadcast_url}")
     except Exception as e:
         log(f"  ⚠️ 上传失败: {e}")
