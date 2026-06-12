@@ -306,7 +306,10 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
                 timeout=180,
             )
         data = resp.json()
-        url = data.get("secure_url","")
+        log(f"  Cloudinary响应: {list(data.keys())}")
+        url = data.get("secure_url") or data.get("url") or data.get("playback_url","")
+        if not url:
+            raise RuntimeError(f"Cloudinary未返回URL: {data}")
         return url
 
     log("  📤 上传预告音频到Cloudinary...")
