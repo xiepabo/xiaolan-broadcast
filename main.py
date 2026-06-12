@@ -166,21 +166,25 @@ def generate_scripts(articles: list[dict]) -> tuple[str, str]:
 def text_to_speech(text: str, filename: str) -> str:
     """将文本转为语音，返回文件路径"""
     log(f"🎙️  ElevenLabs合成语音：{filename}...")
+    from elevenlabs import VoiceSettings
     client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
-    audio = client.generate(
+    audio = client.text_to_speech.convert(
         text=text,
-        voice=config.ELEVENLABS_VOICE_ID,
-        model="eleven_multilingual_v2",  # 最新多语言模型，中文效果最好
-        voice_settings={
-            "stability":         config.VOICE_STABILITY,
-            "similarity_boost":  config.VOICE_SIMILARITY,
-            "style":             config.VOICE_STYLE,
-            "use_speaker_boost": config.VOICE_SPEAKER_BOOST,
-        }
+        voice_id=config.ELEVENLABS_VOICE_ID,
+        model_id="eleven_multilingual_v2",
+        voice_settings=VoiceSettings(
+            stability=config.VOICE_STABILITY,
+            similarity_boost=config.VOICE_SIMILARITY,
+            style=config.VOICE_STYLE,
+            use_speaker_boost=config.VOICE_SPEAKER_BOOST,
+        )
     )
     filepath = os.path.join(config.OUTPUT_DIR, filename)
-    save(audio, filepath)
+    with open(filepath, "wb") as f:
+        for chunk in audio:
+            if chunk:
+                f.write(chunk)
     size_kb = os.path.getsize(filepath) // 1024
     log(f"  ✓ 语音文件：{filepath}（{size_kb} KB）")
     return filepath
