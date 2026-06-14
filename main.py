@@ -49,40 +49,91 @@ def ensure_output_dir():
 # ── 第一步：抓取新闻 ──────────────────────────────────────────
 
 def fetch_news() -> list:
-    log("📡 开始抓取新闻RSS...")
-    articles = []
+    """用Claude API搜索当天UAE新闻，不依赖RSS"""
+    log("📡 开始抓取当天新闻...")
     today = datetime.date.today()
+    date_str = today.strftime("%Y年%m月%d日")
 
-    for url in config.NEWS_SOURCES:
+    # 先用requests抓几个新闻网站的内容
+    articles = []
+    
+    # 方案1：尝试RSS（有就用）
+    import feedparser
+    rss_sources = config.NEWS_SOURCES
+    for url in rss_sources:
         try:
             feed = feedparser.parse(url)
             source_name = feed.feed.get("title", url)
-            count = 0
             for entry in feed.entries[:8]:
-                published = entry.get("published_parsed") or entry.get("updated_parsed")
-                if published:
-                    pub_date = datetime.date(*published[:3])
-                    if (today - pub_date).days > 1:
+                pub = entry.get("published_parsed") or entry.get("updated_parsed")
+                if pub:
+                    pub_date = datetime.date(*pub[:3])
+                    if (today - pub_date).days > 3:
                         continue
-
-                title   = entry.get("title", "").strip()
+                title = entry.get("title", "").strip()
                 summary = entry.get("summary", entry.get("description", "")).strip()
                 import re
                 summary = re.sub(r"<[^>]+>", "", summary)[:500]
-
                 if title:
                     articles.append({
                         "source": source_name,
-                        "title":  title,
+                        "title": title,
                         "summary": summary,
-                        "link":   entry.get("link", ""),
+                        "link": entry.get("link", ""),
                     })
-                    count += 1
-
-            log(f"  ✓ {source_name}: {count}条")
+            if articles:
+                log(f"  ✓ RSS抓取成功：{len(articles)}条")
         except Exception as e:
-            log(f"  ✗ 抓取失败 {url}: {e}")
+            log(f"  ⚠ RSS失败 {url[:40]}: {e}")
 
+    # 方案2：如果RSS没内容，用Claude搜索当天新闻
+    if len(articles) < 3:
+        log("  RSS内容不足，改用AI搜索当天新闻...")
+        from anthropic import Anthropic
+        client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        
+        search_prompt = f"""今天是{date_str}，请你根据你知道的最新信息，列出今天或最近几天阿联酋（UAE）和海湾地区的重要新闻，重点包括：
+1. 金融和银行业动态
+2. 经济政策和数据
+3. 房地产市场
+4. 地缘政治（尤其是霍尔木兹海峡、伊朗、以色列等影响海湾的局势）
+5. 重要企业动态（Emaar、ADNOC、FAB等）
+
+请列出8-15条新闻，每条格式：
+标题：[新闻标题]
+摘要：[2-3句话的详细说明]
+---
+
+只输出新闻列表，不要其他内容。"""
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": search_prompt}],
+        )
+        
+        raw = resp.content[0].text.strip()
+        # 解析输出
+        import re
+        items = raw.split("---")
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+            title_match = re.search(r"标题[：:]\s*(.+)", item)
+            summary_match = re.search(r"摘要[：:]\s*(.+)", item, re.DOTALL)
+            if title_match:
+                title = title_match.group(1).strip()
+                summary = summary_match.group(1).strip() if summary_match else ""
+                articles.append({
+                    "source": "AI综合新闻",
+                    "title": title,
+                    "summary": summary[:500],
+                    "link": "",
+                })
+        log(f"  ✓ AI搜索获取：{len(articles)}条新闻")
+
+    # 去重
     seen, unique = set(), []
     for a in articles:
         if a["title"] not in seen:
@@ -93,7 +144,6 @@ def fetch_news() -> list:
     log(f"📰 共获取 {len(unique)} 条不重复新闻")
     return unique
 
-# ── 第二步：Claude生成预告 + 播报稿 ──────────────────────────
 
 def generate_scripts(articles: list) -> tuple:
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
@@ -159,7 +209,7 @@ def text_to_speech(text: str, filename: str) -> str:
     if len(text) <= MAX_CHARS:
         response = client.audio.speech.create(
             model="tts-1-hd",
-            voice="nova",        # nova=低沉男声，适合财经播报
+            voice="onyx",        # onyx=低沉男声，适合财经播报
             input=text,
             speed=1.0,
         )
@@ -186,7 +236,7 @@ def text_to_speech(text: str, filename: str) -> str:
         for idx, chunk in enumerate(chunks):
             resp = client.audio.speech.create(
                 model="tts-1-hd",
-                voice="nova",
+                voice="onyx",
                 input=chunk,
                 speed=1.0,
             )
