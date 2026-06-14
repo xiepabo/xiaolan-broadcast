@@ -209,7 +209,7 @@ def text_to_speech(text: str, filename: str) -> str:
     if len(text) <= MAX_CHARS:
         response = client.audio.speech.create(
             model="tts-1-hd",
-            voice="onyx",        # onyx=低沉男声，适合财经播报
+            voice="nova",        # onyx=低沉男声，适合财经播报
             input=text,
             speed=1.0,
         )
@@ -236,7 +236,7 @@ def text_to_speech(text: str, filename: str) -> str:
         for idx, chunk in enumerate(chunks):
             resp = client.audio.speech.create(
                 model="tts-1-hd",
-                voice="onyx",
+                voice="nova",
                 input=chunk,
                 speed=1.0,
             )
