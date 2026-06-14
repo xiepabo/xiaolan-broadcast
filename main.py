@@ -252,9 +252,11 @@ def text_to_speech(text: str, filename: str) -> str:
 def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
     ensure_output_dir()
     date_tag = datetime.date.today().strftime("%Y%m%d")
-    preview_file   = text_to_speech(preview_text,   f"xiaolan_preview_{date_tag}.mp3")
-    broadcast_file = text_to_speech(broadcast_text, f"xiaolan_broadcast_{date_tag}.mp3")
-    return preview_file, broadcast_file
+    # 合并预告和正文为一个语音文件
+    combined_text = preview_text + "\n\n" + broadcast_text
+    combined_file = text_to_speech(combined_text, f"xiaolan_broadcast_{date_tag}.mp3")
+    # preview_file和broadcast_file都返回同一个文件
+    return combined_file, combined_file
 
 # ── 第四步：上传音频 ──────────────────────────────────────────
 
@@ -427,20 +429,11 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
             client.messages.create(from_=from_num, to=recipient, body=text_msg)
             time.sleep(2)
 
-            # 消息2：预告语音
-            if preview_url:
-                client.messages.create(
-                    from_=from_num, to=recipient,
-                    body="🎙️ 今日预告（30秒）",
-                    media_url=[preview_url]
-                )
-                time.sleep(2)
-
-            # 消息3：完整播报语音
+            # 消息2：完整语音（预告+正文合并）
             if broadcast_url:
                 client.messages.create(
                     from_=from_num, to=recipient,
-                    body="📻 完整播报（7-10分钟）",
+                    body="🎙️ 小蓝人语音播报（预告+全文）",
                     media_url=[broadcast_url]
                 )
 
