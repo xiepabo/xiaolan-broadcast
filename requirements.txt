@@ -4,3 +4,4 @@ twilio>=9.0.0
 feedparser>=6.0.10
 requests>=2.31.0
 pydub>=0.25.1
+yfinance>=0.2.40
