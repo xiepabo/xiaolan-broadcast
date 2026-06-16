@@ -2,7 +2,7 @@ name: 小蓝人每日播报
 
 on:
   schedule:
-    - cron: '30 13 * * 1-5'
+    - cron: '25 13 * * 1-5'
   workflow_dispatch:
 
 permissions:
