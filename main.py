@@ -291,7 +291,7 @@ def web_search_news(date_str: str) -> list:
 
 
 
-def generate_scripts(articles: list, market_data: str = "", search_articles: list = None) -> tuple:
+def generate_scripts(articles: list, market_data: str = "", search_articles: list = None, recent_context: str = "") -> tuple:
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
     date = today_str()
 
@@ -352,6 +352,7 @@ def generate_scripts(articles: list, market_data: str = "", search_articles: lis
             date=date,
             news_data=news_data_full,
             market_data=market_data or "（行情数据暂缺）",
+            recent_context=recent_context or "（暂无历史记忆，今日为首次播报）",
         )}],
     )
     broadcast_text = resp2.content[0].text.strip()
@@ -464,7 +465,189 @@ def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
     return combined_file, combined_file
 
 
-# ── 第四步：上传音频到 GitHub audio 分支，获取 raw 直链 ────────
+# ── 记忆系统：读取/存储近7天播报摘要 ────────────────────────
+
+def _github_api(method: str, path: str, **kwargs) -> requests.Response:
+    """统一的 GitHub Contents API 调用"""
+    gh_token = os.environ.get("GITHUB_TOKEN", "")
+    gh_repo  = os.environ.get("GITHUB_REPOSITORY", "")
+    headers = {
+        "Authorization": f"token {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.github.com/repos/{gh_repo}/{path}"
+    return requests.request(method, url, headers=headers, timeout=30, **kwargs)
+
+
+def _ensure_branch(branch: str):
+    """确保指定分支存在，不存在则从默认分支创建"""
+    gh_repo = os.environ.get("GITHUB_REPOSITORY", "")
+    resp = _github_api("GET", f"branches/{branch}")
+    if resp.status_code == 404:
+        default = _github_api("GET", "").json().get("default_branch", "main")
+        sha = _github_api("GET", f"git/refs/heads/{default}").json().get("object", {}).get("sha", "")
+        _github_api("POST", "git/refs", json={"ref": f"refs/heads/{branch}", "sha": sha})
+        log(f"  ✓ 分支 {branch} 已创建")
+
+
+def load_memory() -> str:
+    """
+    从 GitHub memory 分支读取最近7天的播报摘要。
+    返回格式化字符串，供提示词使用。
+    """
+    import base64
+    log("🧠 读取近期记忆...")
+
+    gh_token = os.environ.get("GITHUB_TOKEN", "")
+    gh_repo  = os.environ.get("GITHUB_REPOSITORY", "")
+    if not gh_token or not gh_repo:
+        log("  ⚠ 无GitHub凭证，跳过记忆读取")
+        return ""
+
+    branch = "memory"
+    memories = []
+
+    # 读取最近7个工作日的摘要
+    today = datetime.date.today()
+    for i in range(1, 11):  # 往前找10天，取到7个有记录的
+        day = today - datetime.timedelta(days=i)
+        date_tag = day.strftime("%Y%m%d")
+        resp = _github_api("GET", f"contents/daily/{date_tag}.json", params={"ref": branch})
+        if resp.status_code == 200:
+            try:
+                content = base64.b64decode(resp.json().get("content", "")).decode("utf-8")
+                data = json.loads(content)
+                memories.append(data)
+                if len(memories) >= 7:
+                    break
+            except Exception:
+                continue
+
+    if not memories:
+        log("  → 暂无历史记忆（首次运行）")
+        return ""
+
+    log(f"  ✓ 读取到 {len(memories)} 天的记忆")
+
+    # 格式化为提示词上下文
+    lines = ["以下是过去几天的播报摘要，供你参考，播报时可以引用和延续：\n"]
+    for m in reversed(memories):  # 从旧到新
+        lines.append(f"【{m.get('date', '')}】")
+        if m.get("highlights"):
+            for h in m["highlights"]:
+                lines.append(f"  · {h}")
+        if m.get("market_snapshot"):
+            lines.append(f"  行情：{m['market_snapshot']}")
+        if m.get("conclusion"):
+            lines.append(f"  小蓝人说：{m['conclusion']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def summarize_for_memory(broadcast_text: str, market_data: str, date: str) -> dict:
+    """
+    用 Claude 把播报稿压缩成结构化摘要存入记忆。
+    """
+    log("🧠 生成今日记忆摘要...")
+    client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
+
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=500,
+        messages=[{"role": "user", "content": f"""把以下播报稿压缩成结构化摘要，输出JSON格式：
+
+{{
+  "date": "{date}",
+  "highlights": ["最重要的3-5条事件，每条一句话"],
+  "market_snapshot": "油价/金价/DFM指数的关键数据，一句话",
+  "conclusion": "今天小蓝人说的核心判断，一句话"
+}}
+
+只输出JSON，不要其他内容。
+
+播报稿：
+{broadcast_text[:3000]}
+
+行情数据：
+{market_data}"""}],
+    )
+
+    import re
+    text = resp.content[0].text.strip()
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group())
+            log(f"  ✓ 摘要生成完成：{len(data.get('highlights', []))}条要点")
+            return data
+        except Exception as e:
+            log(f"  ⚠ JSON解析失败：{e}")
+
+    # 兜底：返回简单结构
+    return {"date": date, "highlights": [broadcast_text[:100]], "market_snapshot": "", "conclusion": ""}
+
+
+def save_memory(summary: dict):
+    """
+    把今日摘要写入 GitHub memory 分支的 daily/YYYYMMDD.json。
+    同时清理14天前的旧文件。
+    """
+    import base64
+    log("🧠 保存今日记忆...")
+
+    gh_token = os.environ.get("GITHUB_TOKEN", "")
+    gh_repo  = os.environ.get("GITHUB_REPOSITORY", "")
+    if not gh_token or not gh_repo:
+        log("  ⚠ 无GitHub凭证，跳过记忆保存")
+        return
+
+    try:
+        _ensure_branch("memory")
+
+        date_tag = datetime.date.today().strftime("%Y%m%d")
+        file_path = f"daily/{date_tag}.json"
+        content_str = json.dumps(summary, ensure_ascii=False, indent=2)
+        content_b64 = base64.b64encode(content_str.encode()).decode()
+
+        # 检查是否已存在（覆盖需要 sha）
+        existing = _github_api("GET", f"contents/{file_path}", params={"ref": "memory"})
+        old_sha = existing.json().get("sha", "") if existing.status_code == 200 else ""
+
+        body = {
+            "message": f"memory: {date_tag}",
+            "content": content_b64,
+            "branch": "memory",
+        }
+        if old_sha:
+            body["sha"] = old_sha
+
+        put = _github_api("PUT", f"contents/{file_path}", json=body)
+        if put.status_code in (200, 201):
+            log(f"  ✓ 记忆已保存：{file_path}")
+        else:
+            log(f"  ⚠ 保存失败：{put.status_code}")
+
+        # 清理14天前的旧记忆
+        cutoff = datetime.date.today() - datetime.timedelta(days=14)
+        cutoff_tag = cutoff.strftime("%Y%m%d")
+        list_resp = _github_api("GET", "contents/daily", params={"ref": "memory"})
+        if list_resp.status_code == 200:
+            for f in list_resp.json():
+                fname = f.get("name", "")
+                if fname.endswith(".json") and fname.replace(".json", "") < cutoff_tag:
+                    _github_api("DELETE", f"contents/daily/{fname}", json={
+                        "message": f"cleanup: {fname}",
+                        "sha": f.get("sha", ""),
+                        "branch": "memory",
+                    })
+                    log(f"  🗑 清理旧记忆：{fname}")
+
+    except Exception as e:
+        log(f"  ⚠ 记忆保存失败：{e}")
+
+
 
 def upload_audio_to_github(filepath: str) -> str:
     """
@@ -613,12 +796,11 @@ def main():
     start = time.time()
 
     try:
+        recent_context = load_memory()
         articles = fetch_news()
-        # 无新闻也继续，Claude会播报各板块无动态
-
         search_articles = web_search_news(today_str())
         market_data = fetch_market_data()
-        preview_text, broadcast_text = generate_scripts(articles, market_data, search_articles)
+        preview_text, broadcast_text = generate_scripts(articles, market_data, search_articles, recent_context)
 
         ensure_output_dir()
         date_tag = datetime.date.today().strftime("%Y%m%d")
@@ -632,6 +814,10 @@ def main():
         log("💾 文本备份已保存")
 
         preview_file, broadcast_file = synthesize_audio(preview_text, broadcast_text)
+
+        # 保存今日记忆
+        summary = summarize_for_memory(broadcast_text, market_data, today_str())
+        save_memory(summary)
 
         log("📱 发送WhatsApp消息...")
         send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file)
