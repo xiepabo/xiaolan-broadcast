@@ -7,8 +7,8 @@
 1. 抓取RSS新闻
 2. Claude生成"今日预告"（一句话报菜名）
 3. Claude生成完整播报稿
-4. OpenAI TTS合成语音
-5. 上传到 file.io 获取公开直链
+4. OpenAI TTS合成语音 + lo-fi背景音乐混音
+5. 音频 push 到 GitHub audio 分支，获得 raw.githubusercontent.com 直链
 6. Twilio发送文字 + 语音到WhatsApp
 """
 
@@ -55,9 +55,7 @@ def fetch_news() -> list:
     date_str = today.strftime("%Y年%m月%d日")
     articles = []
 
-    # 方案1：RSS
-    rss_sources = config.NEWS_SOURCES
-    for url in rss_sources:
+    for url in config.NEWS_SOURCES:
         try:
             feed = feedparser.parse(url)
             source_name = feed.feed.get("title", url)
@@ -83,7 +81,6 @@ def fetch_news() -> list:
         except Exception as e:
             log(f"  ⚠ RSS失败 {url[:40]}: {e}")
 
-    # 方案2：Claude AI兜底
     if len(articles) < 3:
         log("  RSS内容不足，改用AI搜索当天新闻...")
         client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
@@ -100,7 +97,6 @@ def fetch_news() -> list:
 ---
 
 只输出新闻列表，不要其他内容。"""
-
         resp = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2000,
@@ -123,7 +119,6 @@ def fetch_news() -> list:
                 })
         log(f"  ✓ AI搜索获取：{len(articles)}条新闻")
 
-    # 去重
     seen, unique = set(), []
     for a in articles:
         if a["title"] not in seen:
@@ -141,12 +136,10 @@ def generate_scripts(articles: list) -> tuple:
     date = today_str()
 
     news_list_short = "\n".join(
-        f"{i+1}. 【{a['source']}】{a['title']}"
-        for i, a in enumerate(articles)
+        f"{i+1}. 【{a['source']}】{a['title']}" for i, a in enumerate(articles)
     )
     news_data_full = "\n\n".join(
-        f"来源：{a['source']}\n标题：{a['title']}\n摘要：{a['summary']}"
-        for a in articles
+        f"来源：{a['source']}\n标题：{a['title']}\n摘要：{a['summary']}" for a in articles
     )
 
     log("🤖 Claude正在生成今日预告...")
@@ -193,9 +186,10 @@ def text_to_speech(text: str, filename: str) -> str:
     filepath = os.path.join(config.OUTPUT_DIR, filename)
 
     if len(text) <= MAX_CHARS:
-        client.audio.speech.create(
+        with client.audio.speech.with_streaming_response.create(
             model="tts-1-hd", voice="nova", input=text, speed=1.0,
-        ).stream_to_file(filepath)
+        ) as response:
+            response.stream_to_file(filepath)
     else:
         chunks, current = [], ""
         for w in text.split("。"):
@@ -210,9 +204,10 @@ def text_to_speech(text: str, filename: str) -> str:
         log(f"  文本较长，分{len(chunks)}段合成...")
         audio_data = b""
         for chunk in chunks:
-            audio_data += client.audio.speech.create(
+            with client.audio.speech.with_streaming_response.create(
                 model="tts-1-hd", voice="nova", input=chunk, speed=1.0,
-            ).content
+            ) as response:
+                audio_data += response.read()
         with open(filepath, "wb") as f:
             f.write(audio_data)
 
@@ -224,10 +219,7 @@ def text_to_speech(text: str, filename: str) -> str:
 # ── 第三步b：lo-fi背景音乐混音 ───────────────────────────────
 
 def mix_lofi_background(speech_path: str, output_path: str) -> str:
-    """
-    背景音乐降至 -18 dB，循环填满语音时长，淡入淡出 3 秒。
-    pydub + ffmpeg 均需安装；任意失败则回退原始语音。
-    """
+    """背景音乐 -18 dB，循环填满语音时长，淡入淡出 3 秒。失败则回退原始语音。"""
     try:
         from pydub import AudioSegment
         log("🎵 混入 lo-fi 背景音乐...")
@@ -243,12 +235,11 @@ def mix_lofi_background(speech_path: str, output_path: str) -> str:
             r.raise_for_status()
             with open(lofi_local, "wb") as f:
                 f.write(r.content)
-            log(f"  ✓ 背景音乐已缓存")
+            log("  ✓ 背景音乐已缓存")
 
         bg = AudioSegment.from_mp3(lofi_local)
         bg_loop = (bg * ((duration_ms // len(bg)) + 2))[:duration_ms]
         bg_quiet = (bg_loop - 18).fade_in(3000).fade_out(3000)
-
         speech.overlay(bg_quiet).export(output_path, format="mp3", bitrate="128k")
         size_kb = os.path.getsize(output_path) // 1024
         log(f"  ✓ 混音完成：{output_path}（{size_kb} KB）")
@@ -272,37 +263,93 @@ def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
     return combined_file, combined_file
 
 
-# ── 第四步：上传音频，获取公开直链 ───────────────────────────
+# ── 第四步：上传音频到 GitHub audio 分支，获取 raw 直链 ────────
 
-def upload_audio_for_whatsapp(filepath: str) -> str:
+def upload_audio_to_github(filepath: str) -> str:
     """
-    把 mp3 上传到 file.io，返回公开直链（14天有效，Twilio可直接访问）。
-    file.io 完全免费、无需账号、无需配置。
-    """
-    log(f"☁️  上传音频到 file.io：{os.path.basename(filepath)}...")
-    size_kb = os.path.getsize(filepath) // 1024
+    把 mp3 用 GitHub Contents API 写入仓库的 audio 分支。
+    返回 raw.githubusercontent.com 直链（无重定向，Twilio 可直接访问）。
 
-    with open(filepath, "rb") as f:
-        resp = requests.post(
-            "https://file.io",
-            files={"file": (os.path.basename(filepath), f, "audio/mpeg")},
-            data={"expires": "14d", "maxDownloads": 100, "autoDelete": False},
-            timeout=120,
+    audio 分支如果不存在会自动基于默认分支创建。
+    同名文件会覆盖（需要先拿旧文件 sha）。
+    """
+    import base64
+
+    gh_token = os.environ.get("GITHUB_TOKEN", "")
+    gh_repo  = os.environ.get("GITHUB_REPOSITORY", "")  # "owner/repo"
+    if not gh_token or not gh_repo:
+        raise RuntimeError("GITHUB_TOKEN 或 GITHUB_REPOSITORY 未设置")
+
+    fname = os.path.basename(filepath)
+    branch = "audio"
+    api_base = f"https://api.github.com/repos/{gh_repo}"
+    headers = {
+        "Authorization": f"token {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+    log(f"  ☁️  上传音频到 GitHub audio 分支：{fname}...")
+
+    # 1. 确保 audio 分支存在（不存在则从默认分支创建）
+    branch_resp = requests.get(f"{api_base}/branches/{branch}", headers=headers, timeout=15)
+    if branch_resp.status_code == 404:
+        log("  → audio 分支不存在，正在创建...")
+        # 获取默认分支的最新 commit sha
+        default_resp = requests.get(f"{api_base}", headers=headers, timeout=15)
+        default_branch = default_resp.json().get("default_branch", "main")
+        ref_resp = requests.get(
+            f"{api_base}/git/refs/heads/{default_branch}", headers=headers, timeout=15
         )
+        base_sha = ref_resp.json().get("object", {}).get("sha", "")
+        # 创建分支
+        requests.post(
+            f"{api_base}/git/refs",
+            headers=headers,
+            json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+            timeout=15,
+        )
+        log(f"  ✓ audio 分支已创建")
 
-    if not resp.ok:
-        raise RuntimeError(f"file.io 上传失败 {resp.status_code}: {resp.text[:200]}")
+    # 2. 检查同名文件是否已存在（获取 sha，覆盖时需要）
+    file_path_in_repo = f"audio/{fname}"
+    existing_resp = requests.get(
+        f"{api_base}/contents/{file_path_in_repo}",
+        headers=headers,
+        params={"ref": branch},
+        timeout=15,
+    )
+    old_sha = existing_resp.json().get("sha", "") if existing_resp.status_code == 200 else ""
 
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"file.io 返回失败: {data}")
+    # 3. 读取文件并 base64 编码
+    with open(filepath, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode()
 
-    url = data.get("link", "")
-    if not url:
-        raise RuntimeError(f"file.io 无URL返回: {data}")
+    # 4. PUT 写入文件
+    put_body = {
+        "message": f"audio: {fname}",
+        "content": content_b64,
+        "branch": branch,
+    }
+    if old_sha:
+        put_body["sha"] = old_sha  # 覆盖已有文件需要旧 sha
 
-    log(f"  ✓ 上传成功（{size_kb} KB）→ {url}")
-    return url
+    put_resp = requests.put(
+        f"{api_base}/contents/{file_path_in_repo}",
+        headers=headers,
+        json=put_body,
+        timeout=180,
+    )
+
+    if put_resp.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub 写入失败 {put_resp.status_code}: {put_resp.text[:300]}")
+
+    # 5. 构造 raw 直链
+    owner, repo = gh_repo.split("/", 1)
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/audio/{fname}"
+    size_kb = os.path.getsize(filepath) // 1024
+    log(f"  ✓ 上传成功（{size_kb} KB）→ {raw_url}")
+    return raw_url
 
 
 # ── 第五步：发送到WhatsApp ────────────────────────────────────
@@ -316,10 +363,9 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
 
     client = Client(account_sid, auth_token)
 
-    # 上传音频（预告和正文是同一个文件，只上传一次）
     log("  📤 上传音频...")
     try:
-        audio_url = upload_audio_for_whatsapp(broadcast_file)
+        audio_url = upload_audio_to_github(broadcast_file)
     except Exception as e:
         log(f"  ⚠️ 上传失败: {e}")
         audio_url = None
