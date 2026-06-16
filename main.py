@@ -52,7 +52,6 @@ def ensure_output_dir():
 def fetch_news() -> list:
     log("📡 开始抓取当天新闻...")
     today = datetime.date.today()
-    date_str = today.strftime("%Y年%m月%d日")
     articles = []
 
     for url in config.NEWS_SOURCES:
@@ -81,51 +80,18 @@ def fetch_news() -> list:
         except Exception as e:
             log(f"  ⚠ RSS失败 {url[:40]}: {e}")
 
-    if len(articles) < 3:
-        log("  RSS内容不足，改用AI搜索当天新闻...")
-        client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
-        search_prompt = f"""今天是{date_str}，请你根据你知道的最新信息，列出今天或最近几天阿联酋（UAE）和海湾地区的重要新闻，重点包括：
-1. 金融和银行业动态
-2. 经济政策和数据
-3. 房地产市场
-4. 地缘政治（尤其是霍尔木兹海峡、伊朗、以色列等影响海湾的局势）
-5. 重要企业动态（Emaar、ADNOC、FAB等）
-
-请列出8-15条新闻，每条格式：
-标题：[新闻标题]
-摘要：[2-3句话的详细说明]
----
-
-只输出新闻列表，不要其他内容。"""
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": search_prompt}],
-        )
-        raw = resp.content[0].text.strip()
-        import re
-        for item in raw.split("---"):
-            item = item.strip()
-            if not item:
-                continue
-            title_match = re.search(r"标题[：:]\s*(.+)", item)
-            summary_match = re.search(r"摘要[：:]\s*(.+)", item, re.DOTALL)
-            if title_match:
-                articles.append({
-                    "source": "AI综合新闻",
-                    "title": title_match.group(1).strip(),
-                    "summary": (summary_match.group(1).strip() if summary_match else "")[:500],
-                    "link": "",
-                })
-        log(f"  ✓ AI搜索获取：{len(articles)}条新闻")
-
+    # 去重
     seen, unique = set(), []
     for a in articles:
         if a["title"] not in seen:
             seen.add(a["title"])
             unique.append(a)
     unique = unique[:config.MAX_ARTICLES]
-    log(f"📰 共获取 {len(unique)} 条不重复新闻")
+
+    if not unique:
+        log("⚠️ 今日RSS无新闻，将播报无新闻版本")
+    else:
+        log(f"📰 共获取 {len(unique)} 条不重复新闻")
     return unique
 
 
@@ -135,24 +101,29 @@ def generate_scripts(articles: list) -> tuple:
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
     date = today_str()
 
-    news_list_short = "\n".join(
-        f"{i+1}. 【{a['source']}】{a['title']}" for i, a in enumerate(articles)
-    )
-    news_data_full = "\n\n".join(
-        f"来源：{a['source']}\n标题：{a['title']}\n摘要：{a['summary']}" for a in articles
-    )
+    # 无新闻时也能生成（Claude会播报无动态版本）
+    if articles:
+        news_list_short = "\n".join(
+            f"{i+1}. 【{a['source']}】{a['title']}" for i, a in enumerate(articles)
+        )
+        news_data_full = "\n\n".join(
+            f"来源：{a['source']}\n标题：{a['title']}\n摘要：{a['summary']}" for a in articles
+        )
+    else:
+        news_list_short = "（今日RSS无新闻数据）"
+        news_data_full = "（今日RSS无新闻数据，请在各板块按实际情况播报无动态）"
 
-    log("🤖 Claude正在生成今日预告...")
+    log("🤖 Claude正在生成今日预告（一句话）...")
     resp = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1000,
+        max_tokens=100,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": PREVIEW_PROMPT.format(
             date=date, count=len(articles), news_list=news_list_short,
         )}],
     )
     preview_text = resp.content[0].text.strip()
-    log(f"  ✓ 预告词生成完成（{len(preview_text)}字）")
+    log(f"  ✓ 预告：{preview_text}")
 
     log("🤖 Claude正在生成完整播报稿（需要约30秒）...")
     min_chars = config.TARGET_DURATION_MIN * 200
@@ -431,9 +402,7 @@ def main():
 
     try:
         articles = fetch_news()
-        if not articles:
-            log("❌ 没有抓到新闻，退出")
-            sys.exit(1)
+        # 无新闻也继续，Claude会播报各板块无动态
 
         preview_text, broadcast_text = generate_scripts(articles)
 
