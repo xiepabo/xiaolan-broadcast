@@ -51,22 +51,28 @@ def ensure_output_dir():
 
 def fetch_news() -> list:
     log("📡 开始抓取当天新闻...")
-    today = datetime.date.today()
-    articles = []
+    import re
+    now = datetime.datetime.utcnow()
 
+    # 周一(weekday=0)覆盖周末，窗口72小时；其他工作日24小时
+    hours_back = 72 if now.weekday() == 0 else 24
+    cutoff = now - datetime.timedelta(hours=hours_back)
+    log(f"  时间窗口：过去{hours_back}小时（UTC {cutoff.strftime('%m-%d %H:%M')} 至今）")
+
+    articles = []
     for url in config.NEWS_SOURCES:
         try:
             feed = feedparser.parse(url)
             source_name = feed.feed.get("title", url)
-            for entry in feed.entries[:8]:
+            count_before = len(articles)
+            for entry in feed.entries[:15]:
                 pub = entry.get("published_parsed") or entry.get("updated_parsed")
                 if pub:
-                    pub_date = datetime.date(*pub[:3])
-                    if (today - pub_date).days > 3:
+                    pub_dt = datetime.datetime(*pub[:6])
+                    if pub_dt < cutoff:
                         continue
                 title = entry.get("title", "").strip()
                 summary = entry.get("summary", entry.get("description", "")).strip()
-                import re
                 summary = re.sub(r"<[^>]+>", "", summary)[:500]
                 if title:
                     articles.append({
@@ -75,8 +81,9 @@ def fetch_news() -> list:
                         "summary": summary,
                         "link": entry.get("link", ""),
                     })
-            if articles:
-                log(f"  ✓ RSS抓取成功：{len(articles)}条")
+            added = len(articles) - count_before
+            if added:
+                log(f"  ✓ {source_name[:30]}：{added}条")
         except Exception as e:
             log(f"  ⚠ RSS失败 {url[:40]}: {e}")
 
@@ -89,15 +96,66 @@ def fetch_news() -> list:
     unique = unique[:config.MAX_ARTICLES]
 
     if not unique:
-        log("⚠️ 今日RSS无新闻，将播报无新闻版本")
+        log("⚠️ 时间窗口内无新闻")
     else:
         log(f"📰 共获取 {len(unique)} 条不重复新闻")
     return unique
 
 
+
+# ── 第一步b：拉取实时行情数据 ────────────────────────────────
+
+def fetch_market_data() -> str:
+    """
+    用 yfinance 拉取布伦特原油、现货金价、美元指数。
+    返回格式化字符串，直接塞进播报稿提示词。
+    任何数据拉取失败只记录警告，不影响主流程。
+    """
+    log("📊 拉取实时行情数据...")
+    try:
+        import yfinance as yf
+
+        tickers = {
+            "布伦特原油(USD/桶)": "BZ=F",
+            "现货金价(USD/盎司)":  "GC=F",
+            "美元指数":            "DX-Y.NYB",
+        }
+
+        lines = []
+        for name, symbol in tickers.items():
+            try:
+                t = yf.Ticker(symbol)
+                hist = t.history(period="2d", interval="1d")
+                if hist.empty or len(hist) < 1:
+                    lines.append(f"{name}：数据暂缺")
+                    continue
+                price = hist["Close"].iloc[-1]
+                if len(hist) >= 2:
+                    prev  = hist["Close"].iloc[-2]
+                    chg   = price - prev
+                    pct   = chg / prev * 100
+                    arrow = "↑" if chg >= 0 else "↓"
+                    lines.append(f"{name}：{price:.2f}  {arrow}{abs(chg):.2f}（{pct:+.2f}%）")
+                else:
+                    lines.append(f"{name}：{price:.2f}")
+            except Exception as e:
+                lines.append(f"{name}：获取失败（{e}）")
+
+        result = "\n".join(lines)
+        log(f"  ✓ 行情数据:\n    " + "\n    ".join(lines))
+        return result
+
+    except ImportError:
+        log("  ⚠ yfinance 未安装，行情数据跳过")
+        return "（行情数据暂缺，需安装 yfinance）"
+    except Exception as e:
+        log(f"  ⚠ 行情数据获取失败：{e}")
+        return f"（行情数据获取失败：{e}）"
+
+
 # ── 第二步：生成播报稿 ────────────────────────────────────────
 
-def generate_scripts(articles: list) -> tuple:
+def generate_scripts(articles: list, market_data: str = "") -> tuple:
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
     date = today_str()
 
@@ -140,6 +198,7 @@ def generate_scripts(articles: list) -> tuple:
             max_chars=max_chars,
             date=date,
             news_data=news_data_full,
+            market_data=market_data or "（行情数据暂缺）",
         )}],
     )
     broadcast_text = resp2.content[0].text.strip()
@@ -404,7 +463,8 @@ def main():
         articles = fetch_news()
         # 无新闻也继续，Claude会播报各板块无动态
 
-        preview_text, broadcast_text = generate_scripts(articles)
+        market_data = fetch_market_data()
+        preview_text, broadcast_text = generate_scripts(articles, market_data)
 
         ensure_output_dir()
         date_tag = datetime.date.today().strftime("%Y%m%d")
