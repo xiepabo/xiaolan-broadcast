@@ -7,8 +7,9 @@
 1. 抓取RSS新闻
 2. Claude生成"今日预告"（一句话报菜名）
 3. Claude生成完整播报稿
-4. OpenAI TTS合成预告语音 + 正文语音
-5. Twilio发送文字摘要 + 语音到WhatsApp
+4. OpenAI TTS合成语音
+5. 上传到 file.io 获取公开直链
+6. Twilio发送文字 + 语音到WhatsApp
 """
 
 import os
@@ -49,16 +50,12 @@ def ensure_output_dir():
 # ── 第一步：抓取新闻 ──────────────────────────────────────────
 
 def fetch_news() -> list:
-    """用Claude API搜索当天UAE新闻，不依赖RSS"""
     log("📡 开始抓取当天新闻...")
     today = datetime.date.today()
     date_str = today.strftime("%Y年%m月%d日")
-
-    # 先用requests抓几个新闻网站的内容
     articles = []
-    
-    # 方案1：尝试RSS（有就用）
-    import feedparser
+
+    # 方案1：RSS
     rss_sources = config.NEWS_SOURCES
     for url in rss_sources:
         try:
@@ -86,12 +83,10 @@ def fetch_news() -> list:
         except Exception as e:
             log(f"  ⚠ RSS失败 {url[:40]}: {e}")
 
-    # 方案2：如果RSS没内容，用Claude搜索当天新闻
+    # 方案2：Claude AI兜底
     if len(articles) < 3:
         log("  RSS内容不足，改用AI搜索当天新闻...")
-        from anthropic import Anthropic
         client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
-        
         search_prompt = f"""今天是{date_str}，请你根据你知道的最新信息，列出今天或最近几天阿联酋（UAE）和海湾地区的重要新闻，重点包括：
 1. 金融和银行业动态
 2. 经济政策和数据
@@ -111,24 +106,19 @@ def fetch_news() -> list:
             max_tokens=2000,
             messages=[{"role": "user", "content": search_prompt}],
         )
-        
         raw = resp.content[0].text.strip()
-        # 解析输出
         import re
-        items = raw.split("---")
-        for item in items:
+        for item in raw.split("---"):
             item = item.strip()
             if not item:
                 continue
             title_match = re.search(r"标题[：:]\s*(.+)", item)
             summary_match = re.search(r"摘要[：:]\s*(.+)", item, re.DOTALL)
             if title_match:
-                title = title_match.group(1).strip()
-                summary = summary_match.group(1).strip() if summary_match else ""
                 articles.append({
                     "source": "AI综合新闻",
-                    "title": title,
-                    "summary": summary[:500],
+                    "title": title_match.group(1).strip(),
+                    "summary": (summary_match.group(1).strip() if summary_match else "")[:500],
                     "link": "",
                 })
         log(f"  ✓ AI搜索获取：{len(articles)}条新闻")
@@ -139,15 +129,16 @@ def fetch_news() -> list:
         if a["title"] not in seen:
             seen.add(a["title"])
             unique.append(a)
-
     unique = unique[:config.MAX_ARTICLES]
     log(f"📰 共获取 {len(unique)} 条不重复新闻")
     return unique
 
 
+# ── 第二步：生成播报稿 ────────────────────────────────────────
+
 def generate_scripts(articles: list) -> tuple:
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    date   = today_str()
+    date = today_str()
 
     news_list_short = "\n".join(
         f"{i+1}. 【{a['source']}】{a['title']}"
@@ -159,16 +150,13 @@ def generate_scripts(articles: list) -> tuple:
     )
 
     log("🤖 Claude正在生成今日预告...")
-    preview_prompt = PREVIEW_PROMPT.format(
-        date=date,
-        count=len(articles),
-        news_list=news_list_short,
-    )
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": preview_prompt}],
+        messages=[{"role": "user", "content": PREVIEW_PROMPT.format(
+            date=date, count=len(articles), news_list=news_list_short,
+        )}],
     )
     preview_text = resp.content[0].text.strip()
     log(f"  ✓ 预告词生成完成（{len(preview_text)}字）")
@@ -176,53 +164,41 @@ def generate_scripts(articles: list) -> tuple:
     log("🤖 Claude正在生成完整播报稿（需要约30秒）...")
     min_chars = config.TARGET_DURATION_MIN * 200
     max_chars = config.TARGET_DURATION_MAX * 200
-    broadcast_prompt = BROADCAST_PROMPT.format(
-        style=config.BROADCAST_STYLE,
-        min_min=config.TARGET_DURATION_MIN,
-        max_min=config.TARGET_DURATION_MAX,
-        min_chars=min_chars,
-        max_chars=max_chars,
-        date=date,
-        news_data=news_data_full,
-    )
     resp2 = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4000,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": broadcast_prompt}],
+        messages=[{"role": "user", "content": BROADCAST_PROMPT.format(
+            style=config.BROADCAST_STYLE,
+            min_min=config.TARGET_DURATION_MIN,
+            max_min=config.TARGET_DURATION_MAX,
+            min_chars=min_chars,
+            max_chars=max_chars,
+            date=date,
+            news_data=news_data_full,
+        )}],
     )
     broadcast_text = resp2.content[0].text.strip()
     log(f"  ✓ 播报稿生成完成（{len(broadcast_text)}字，约{len(broadcast_text)//200}分钟）")
 
     return preview_text, broadcast_text
 
+
 # ── 第三步：OpenAI TTS语音合成 ────────────────────────────────
 
 def text_to_speech(text: str, filename: str) -> str:
     log(f"🎙️  OpenAI TTS合成语音：{filename}...")
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or config.OPENAI_API_KEY)
-
-    # 超过4096字符需要分段
     MAX_CHARS = 4000
     filepath = os.path.join(config.OUTPUT_DIR, filename)
 
     if len(text) <= MAX_CHARS:
-        response = client.audio.speech.create(
-            model="tts-1-hd",
-            voice="nova",        # onyx=低沉男声，适合财经播报
-            input=text,
-            speed=1.0,
-        )
-        response.stream_to_file(filepath)
+        client.audio.speech.create(
+            model="tts-1-hd", voice="nova", input=text, speed=1.0,
+        ).stream_to_file(filepath)
     else:
-        # 分段合成再合并
-        import math
-        chunks = []
-        words = text.split("。")
-        current = ""
-        chunk_files = []
-
-        for i, w in enumerate(words):
+        chunks, current = [], ""
+        for w in text.split("。"):
             if len(current) + len(w) < MAX_CHARS:
                 current += w + "。"
             else:
@@ -233,15 +209,10 @@ def text_to_speech(text: str, filename: str) -> str:
 
         log(f"  文本较长，分{len(chunks)}段合成...")
         audio_data = b""
-        for idx, chunk in enumerate(chunks):
-            resp = client.audio.speech.create(
-                model="tts-1-hd",
-                voice="nova",
-                input=chunk,
-                speed=1.0,
-            )
-            audio_data += resp.content
-
+        for chunk in chunks:
+            audio_data += client.audio.speech.create(
+                model="tts-1-hd", voice="nova", input=chunk, speed=1.0,
+            ).content
         with open(filepath, "wb") as f:
             f.write(audio_data)
 
@@ -249,53 +220,42 @@ def text_to_speech(text: str, filename: str) -> str:
     log(f"  ✓ 语音文件：{filepath}（{size_kb} KB）")
     return filepath
 
+
+# ── 第三步b：lo-fi背景音乐混音 ───────────────────────────────
+
 def mix_lofi_background(speech_path: str, output_path: str) -> str:
     """
-    将 lo-fi 背景音乐与语音混合。
     背景音乐降至 -18 dB，循环填满语音时长，淡入淡出 3 秒。
-    返回混音后文件路径。
+    pydub + ffmpeg 均需安装；任意失败则回退原始语音。
     """
     try:
         from pydub import AudioSegment
-
         log("🎵 混入 lo-fi 背景音乐...")
+
         speech = AudioSegment.from_mp3(speech_path)
         duration_ms = len(speech)
 
-        # 背景音乐文件路径（优先用本地缓存）
         lofi_local = os.path.join(config.OUTPUT_DIR, "lofi_bg.mp3")
         if not os.path.exists(lofi_local):
-            # 下载免版权 lo-fi 片段（~60s, ~1MB）
-            lofi_url = (
-                "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
-            )
+            lofi_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
             log(f"  ↓ 下载背景音乐：{lofi_url}")
             r = requests.get(lofi_url, timeout=60)
             r.raise_for_status()
             with open(lofi_local, "wb") as f:
                 f.write(r.content)
-            log(f"  ✓ 背景音乐已缓存：{lofi_local}")
+            log(f"  ✓ 背景音乐已缓存")
 
         bg = AudioSegment.from_mp3(lofi_local)
+        bg_loop = (bg * ((duration_ms // len(bg)) + 2))[:duration_ms]
+        bg_quiet = (bg_loop - 18).fade_in(3000).fade_out(3000)
 
-        # 循环背景音到语音时长
-        loops = (duration_ms // len(bg)) + 2
-        bg_loop = (bg * loops)[:duration_ms]
-
-        # 降低背景音量 -18 dB，淡入淡出 3 秒
-        fade_ms = 3000
-        bg_quiet = bg_loop - 18
-        bg_quiet = bg_quiet.fade_in(fade_ms).fade_out(fade_ms)
-
-        # 叠加
-        mixed = speech.overlay(bg_quiet)
-        mixed.export(output_path, format="mp3", bitrate="128k")
+        speech.overlay(bg_quiet).export(output_path, format="mp3", bitrate="128k")
         size_kb = os.path.getsize(output_path) // 1024
         log(f"  ✓ 混音完成：{output_path}（{size_kb} KB）")
         return output_path
 
     except ImportError:
-        log("  ⚠️ pydub 未安装，跳过背景音乐（pip install pydub）")
+        log("  ⚠️ pydub 未安装，跳过背景音乐")
         return speech_path
     except Exception as e:
         log(f"  ⚠️ 背景音乐混音失败，使用原始语音：{e}")
@@ -305,142 +265,64 @@ def mix_lofi_background(speech_path: str, output_path: str) -> str:
 def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
     ensure_output_dir()
     date_tag = datetime.date.today().strftime("%Y%m%d")
-    # 合并预告和正文为一个语音文件
     combined_text = preview_text + "\n\n" + broadcast_text
     raw_file = text_to_speech(combined_text, f"xiaolan_broadcast_raw_{date_tag}.mp3")
-
-    # 混入 lo-fi 背景音乐
     mixed_path = os.path.join(config.OUTPUT_DIR, f"xiaolan_broadcast_{date_tag}.mp3")
     combined_file = mix_lofi_background(raw_file, mixed_path)
-
-    # preview_file 和 broadcast_file 都返回同一个混音文件
     return combined_file, combined_file
 
-# ── 第四步：上传音频 ──────────────────────────────────────────
 
-def upload_to_twilio(filepath: str) -> str:
-    """上传音频到Twilio媒体库，返回URL"""
-    log(f"☁️  上传音频到Twilio：{os.path.basename(filepath)}...")
-    from twilio.rest import Client as TwilioClient
-    tc = TwilioClient(
-        os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID,
-        os.environ.get("TWILIO_AUTH_TOKEN") or config.TWILIO_AUTH_TOKEN,
-    )
+# ── 第四步：上传音频，获取公开直链 ───────────────────────────
+
+def upload_audio_for_whatsapp(filepath: str) -> str:
+    """
+    把 mp3 上传到 file.io，返回公开直链（14天有效，Twilio可直接访问）。
+    file.io 完全免费、无需账号、无需配置。
+    """
+    log(f"☁️  上传音频到 file.io：{os.path.basename(filepath)}...")
+    size_kb = os.path.getsize(filepath) // 1024
+
     with open(filepath, "rb") as f:
-        media = tc.media.v1.media_processor.list()
-    # 用requests直接上传到Twilio Assets
-    import base64
-    sid = os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID
-    token = os.environ.get("TWILIO_AUTH_TOKEN") or config.TWILIO_AUTH_TOKEN
-    with open(filepath, "rb") as f:
-        audio_data = f.read()
-    resp = requests.post(
-        f"https://mcs.us1.twilio.com/v1/Services",
-        auth=(sid, token),
-        json={"FriendlyName": os.path.basename(filepath)},
-        timeout=30,
-    )
-    service_sid = resp.json().get("sid", "")
-    resp2 = requests.post(
-        f"https://mcs.us1.twilio.com/v1/Services/{service_sid}/Assets",
-        auth=(sid, token),
-        data={"FriendlyName": os.path.basename(filepath), "Visibility": "public"},
-        timeout=30,
-    )
-    asset_sid = resp2.json().get("sid", "")
-    resp3 = requests.post(
-        f"https://mcs.us1.twilio.com/v1/Services/{service_sid}/Assets/{asset_sid}/Versions",
-        auth=(sid, token),
-        files={"Content": (os.path.basename(filepath), open(filepath,"rb"), "audio/mpeg")},
-        data={"Path": f"/{os.path.basename(filepath)}", "Visibility": "public"},
-        timeout=120,
-    )
-    url = f"https://mcs.us1.twilio.com/v1/Services/{service_sid}/Assets/{asset_sid}/Versions/{resp3.json().get('sid','')}"
-    log(f"  ✓ 上传成功")
+        resp = requests.post(
+            "https://file.io",
+            files={"file": (os.path.basename(filepath), f, "audio/mpeg")},
+            data={"expires": "14d", "maxDownloads": 100, "autoDelete": False},
+            timeout=120,
+        )
+
+    if not resp.ok:
+        raise RuntimeError(f"file.io 上传失败 {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+    if not data.get("success"):
+        raise RuntimeError(f"file.io 返回失败: {data}")
+
+    url = data.get("link", "")
+    if not url:
+        raise RuntimeError(f"file.io 无URL返回: {data}")
+
+    log(f"  ✓ 上传成功（{size_kb} KB）→ {url}")
     return url
+
 
 # ── 第五步：发送到WhatsApp ────────────────────────────────────
 
-
 def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file):
-    """直接用Twilio发送音频文件（无需上传到第三方）"""
-    from twilio.rest import Client as TC
-    import base64
-
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID
     auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")  or config.TWILIO_AUTH_TOKEN
     recipients  = config.WHATSAPP_RECIPIENTS
     from_num    = config.TWILIO_WHATSAPP_FROM
     date        = today_str()
 
-    client = TC(account_sid, auth_token)
+    client = Client(account_sid, auth_token)
 
-    # 文字摘要
-    summary_lines = []
-    for line in broadcast_text.split("\n"):
-        line = line.strip()
-        if line.startswith("【") and line.endswith("】"):
-            summary_lines.append(line)
-        if len(summary_lines) >= 6:
-            break
-
-    text_msg = (
-        f"🔵 *小蓝人播报* · {date}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"{chr(10).join(summary_lines)}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"👇 语音版：先听预告，再听全文"
-    )
-
-    # 上传音频到 Cloudinary（稳定直链，Twilio 可直接访问）
-    def cloudinary_upload(fpath):
-        import hashlib, hmac, time as _time
-        cloud_name  = os.environ.get("CLOUDINARY_CLOUD_NAME") or config.CLOUDINARY_CLOUD_NAME
-        api_key     = os.environ.get("CLOUDINARY_API_KEY")    or config.CLOUDINARY_API_KEY
-        api_secret  = os.environ.get("CLOUDINARY_API_SECRET") or config.CLOUDINARY_API_SECRET
-
-        if not cloud_name or not api_key or not api_secret:
-            raise RuntimeError("Cloudinary 凭证未配置，请设置 CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET")
-
-        fname       = os.path.splitext(os.path.basename(fpath))[0]
-        timestamp   = str(int(_time.time()))
-        public_id   = fname
-
-        # 生成签名
-        params_to_sign = f"public_id={public_id}&timestamp={timestamp}&resource_type=video"
-        sig = hashlib.sha1((params_to_sign + api_secret).encode()).hexdigest()
-
-        with open(fpath, "rb") as f:
-            up_resp = requests.post(
-                f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
-                data={
-                    "api_key":    api_key,
-                    "timestamp":  timestamp,
-                    "public_id":  public_id,
-                    "signature":  sig,
-                },
-                files={"file": (os.path.basename(fpath), f, "audio/mpeg")},
-                timeout=180,
-            )
-        up_resp.raise_for_status()
-        url = up_resp.json().get("secure_url", "")
-        return url
-
-    log("  📤 上传预告音频到Cloudinary...")
+    # 上传音频（预告和正文是同一个文件，只上传一次）
+    log("  📤 上传音频...")
     try:
-        preview_url = cloudinary_upload(preview_file)
-        log(f"  ✓ 预告URL: {preview_url}")
+        audio_url = upload_audio_for_whatsapp(broadcast_file)
     except Exception as e:
         log(f"  ⚠️ 上传失败: {e}")
-        preview_url = None
-
-    log("  📤 上传正文音频到Cloudinary...")
-    try:
-        broadcast_url = cloudinary_upload(broadcast_file)
-        log(f"  ✓ 正文URL: {broadcast_url}")
-    except Exception as e:
-        log(f"  ⚠️ 上传失败: {e}")
-        broadcast_url = None
+        audio_url = None
 
     for recipient in recipients:
         try:
@@ -454,67 +336,24 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
                 f"━━━━━━━━━━━━━━━━\n"
                 f"{preview_body}\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"👇 语音版：先听预告，再听全文"
+                f"👇 语音版点击下方收听"
             )
             client.messages.create(from_=from_num, to=recipient, body=text_msg)
             time.sleep(2)
 
-            # 消息2：完整语音（预告+正文合并）
-            if broadcast_url:
+            # 消息2：语音
+            if audio_url:
                 client.messages.create(
                     from_=from_num, to=recipient,
                     body="🎙️ 小蓝人语音播报（预告+全文）",
-                    media_url=[broadcast_url]
+                    media_url=[audio_url],
                 )
+                time.sleep(1)
 
             log(f"  ✓ 已发送至 {recipient}")
         except Exception as e:
             log(f"  ✗ 发送失败 {recipient}: {e}")
 
-def send_whatsapp(preview_text, broadcast_text, preview_audio_url, broadcast_audio_url):
-    client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-    date   = today_str()
-
-    summary_lines = []
-    for line in broadcast_text.split("\n"):
-        line = line.strip()
-        if line.startswith("【") and line.endswith("】"):
-            summary_lines.append(line)
-        if len(summary_lines) >= 6:
-            break
-
-    text_msg = (
-        f"🔵 *小蓝人播报* · {date}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"{chr(10).join(summary_lines)}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"👇 语音版：先听预告，再听全文"
-    )
-
-    for recipient in config.WHATSAPP_RECIPIENTS:
-        try:
-            client.messages.create(
-                from_=config.TWILIO_WHATSAPP_FROM,
-                to=recipient,
-                body=text_msg,
-            )
-            time.sleep(1)
-            client.messages.create(
-                from_=config.TWILIO_WHATSAPP_FROM,
-                to=recipient,
-                body="🎙️ 今日预告（30秒）",
-                media_url=[preview_audio_url],
-            )
-            time.sleep(1)
-            client.messages.create(
-                from_=config.TWILIO_WHATSAPP_FROM,
-                to=recipient,
-                body="📻 完整播报（7-10分钟）",
-                media_url=[broadcast_audio_url],
-            )
-            log(f"  ✓ 已发送至 {recipient}")
-        except Exception as e:
-            log(f"  ✗ 发送失败 {recipient}: {e}")
 
 # ── 主流程 ────────────────────────────────────────────────────
 
@@ -541,7 +380,7 @@ def main():
             f.write(preview_text)
             f.write("\n\n=== 完整播报稿 ===\n\n")
             f.write(broadcast_text)
-        log(f"💾 文本备份已保存")
+        log("💾 文本备份已保存")
 
         preview_file, broadcast_file = synthesize_audio(preview_text, broadcast_text)
 
