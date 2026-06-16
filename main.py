@@ -219,27 +219,45 @@ def text_to_speech(text: str, filename: str) -> str:
 # ── 第三步b：lo-fi背景音乐混音 ───────────────────────────────
 
 def mix_lofi_background(speech_path: str, output_path: str) -> str:
-    """背景音乐 -18 dB，循环填满语音时长，淡入淡出 3 秒。失败则回退原始语音。"""
+    """
+    从 config.LOFI_PLAYLIST 随机选一首，下载缓存后混音。
+    背景音量 -23 dB（更安静），淡入淡出 3 秒。
+    失败则回退原始语音。
+    """
     try:
+        import random
         from pydub import AudioSegment
         log("🎵 混入 lo-fi 背景音乐...")
 
         speech = AudioSegment.from_mp3(speech_path)
         duration_ms = len(speech)
 
-        lofi_local = os.path.join(config.OUTPUT_DIR, "lofi_bg.mp3")
+        # 从歌单随机选一首
+        playlist = getattr(config, "LOFI_PLAYLIST", [])
+        if not playlist:
+            # 兜底：内置一首
+            playlist = ["https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"]
+
+        chosen_url = random.choice(playlist)
+        # 缓存文件名用 URL hash，不同曲子互不覆盖
+        import hashlib
+        url_hash = hashlib.md5(chosen_url.encode()).hexdigest()[:8]
+        lofi_local = os.path.join(config.OUTPUT_DIR, f"lofi_bg_{url_hash}.mp3")
+
         if not os.path.exists(lofi_local):
-            lofi_url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
-            log(f"  ↓ 下载背景音乐：{lofi_url}")
-            r = requests.get(lofi_url, timeout=60)
+            log(f"  ↓ 下载背景音乐：{chosen_url}")
+            r = requests.get(chosen_url, timeout=60)
             r.raise_for_status()
             with open(lofi_local, "wb") as f:
                 f.write(r.content)
             log("  ✓ 背景音乐已缓存")
+        else:
+            log(f"  ✓ 使用缓存：{lofi_local}")
 
         bg = AudioSegment.from_mp3(lofi_local)
         bg_loop = (bg * ((duration_ms // len(bg)) + 2))[:duration_ms]
-        bg_quiet = (bg_loop - 18).fade_in(3000).fade_out(3000)
+        # -23 dB：比之前的 -18 dB 再安静 5 dB，刚好作为底噪感存在
+        bg_quiet = (bg_loop - 23).fade_in(3000).fade_out(3000)
         speech.overlay(bg_quiet).export(output_path, format="mp3", bitrate="128k")
         size_kb = os.path.getsize(output_path) // 1024
         log(f"  ✓ 混音完成：{output_path}（{size_kb} KB）")
