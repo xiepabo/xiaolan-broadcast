@@ -107,42 +107,75 @@ def fetch_news() -> list:
 
 def fetch_market_data() -> str:
     """
-    用 yfinance 拉取布伦特原油、现货金价、美元指数。
-    返回格式化字符串，直接塞进播报稿提示词。
-    任何数据拉取失败只记录警告，不影响主流程。
+    拉取两类数据：
+    A. 大宗商品 + 宏观：布伦特原油、金价、美元指数
+    B. UAE市场：DFM指数、DFM房地产指数、Emaar、Aldar、ALEC
+    返回格式化字符串直接塞进播报稿提示词。
+    任何单项失败只记录警告，不影响主流程。
     """
     log("📊 拉取实时行情数据...")
     try:
         import yfinance as yf
 
-        tickers = {
+        # A. 大宗商品 & 宏观（国际市场，USD）
+        commodities = {
             "布伦特原油(USD/桶)": "BZ=F",
             "现货金价(USD/盎司)":  "GC=F",
             "美元指数":            "DX-Y.NYB",
         }
 
-        lines = []
-        for name, symbol in tickers.items():
-            try:
-                t = yf.Ticker(symbol)
-                hist = t.history(period="2d", interval="1d")
-                if hist.empty or len(hist) < 1:
-                    lines.append(f"{name}：数据暂缺")
-                    continue
-                price = hist["Close"].iloc[-1]
-                if len(hist) >= 2:
-                    prev  = hist["Close"].iloc[-2]
-                    chg   = price - prev
-                    pct   = chg / prev * 100
-                    arrow = "↑" if chg >= 0 else "↓"
-                    lines.append(f"{name}：{price:.2f}  {arrow}{abs(chg):.2f}（{pct:+.2f}%）")
-                else:
-                    lines.append(f"{name}：{price:.2f}")
-            except Exception as e:
-                lines.append(f"{name}：获取失败（{e}）")
+        # B. UAE本地市场（AED，DFM/ADX）
+        uae_stocks = {
+            "DFM综合指数":      "DFMGI.AE",
+            "DFM房地产指数":    "DFMREI.AE",
+            "Emaar(AED)":       "EMAAR.AE",
+            "Aldar(AED)":       "ALDAR.AE",
+            "ALEC建筑(AED)":    "ALEC.AE",
+        }
 
-        result = "\n".join(lines)
-        log(f"  ✓ 行情数据:\n    " + "\n    ".join(lines))
+        def get_quote(symbol: str, decimals: int = 2) -> str:
+            t = yf.Ticker(symbol)
+            hist = t.history(period="5d", interval="1d")
+            # 过滤掉成交量为0的非交易日
+            hist = hist[hist["Volume"] > 0] if "Volume" in hist.columns else hist
+            if hist.empty:
+                return "数据暂缺"
+            price = hist["Close"].iloc[-1]
+            if len(hist) >= 2:
+                prev  = hist["Close"].iloc[-2]
+                chg   = price - prev
+                pct   = chg / prev * 100
+                arrow = "↑" if chg >= 0 else "↓"
+                return f"{price:.{decimals}f}  {arrow}{abs(chg):.{decimals}f}（{pct:+.2f}%）"
+            return f"{price:.{decimals}f}"
+
+        sections = []
+
+        # A 部分
+        a_lines = ["【大宗商品与宏观】"]
+        for name, symbol in commodities.items():
+            try:
+                a_lines.append(f"  {name}：{get_quote(symbol)}")
+            except Exception as e:
+                a_lines.append(f"  {name}：获取失败")
+        sections.append("\n".join(a_lines))
+
+        # B 部分
+        b_lines = ["【UAE市场】"]
+        for name, symbol in uae_stocks.items():
+            try:
+                # 指数用整数显示，股票用2位小数
+                dec = 0 if "指数" in name else 2
+                b_lines.append(f"  {name}：{get_quote(symbol, dec)}")
+            except Exception as e:
+                b_lines.append(f"  {name}：获取失败")
+        sections.append("\n".join(b_lines))
+
+        result = "\n\n".join(sections)
+        log("  ✓ 行情数据拉取完成")
+        for line in result.split("\n"):
+            if line.strip():
+                log(f"    {line.strip()}")
         return result
 
     except ImportError:
