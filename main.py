@@ -204,6 +204,12 @@ def web_search_news(date_str: str) -> list:
 
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
+    # 判断是否月初（搜本地油价）和月底（提醒油价公布）
+    import datetime as _dt
+    _today = _dt.date.today()
+    _is_month_start = _today.day <= 2
+    _is_month_end   = _today.day >= 28
+
     search_rounds = [
         {
             "label": "地缘安全",
@@ -212,7 +218,7 @@ def web_search_news(date_str: str) -> list:
 2. Iran Gulf Strait of Hormuz tension
 3. Israel Gaza Lebanon war update
 4. Houthi Red Sea attack shipping
-5. Saudi Arabia Iran UAE relations
+5. Saudi Arabia Iran UAE relations diplomacy
 
 搜索后整理为JSON数组，每条格式：
 {{"source":"来源网站","title":"标题（翻译成中文）","summary":"2-3句摘要（中文），重点说对海湾局势的影响"}}
@@ -220,20 +226,63 @@ def web_search_news(date_str: str) -> list:
 只输出JSON数组，不要其他内容。""",
         },
         {
+            "label": "政策与监管",
+            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（48小时内），每个主题搜一次：
+1. UAE economic stimulus policy announcement 2026
+2. UAE Saudi Arabia economic regulation new law
+3. GCC central bank monetary policy interest rate
+4. Dubai Abu Dhabi foreign investment incentive visa
+5. UAE government spending infrastructure budget
+
+搜索后整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（翻译成中文）","summary":"2-3句摘要（中文），说清楚政策内容和影响"}}
+
+只输出JSON数组，不要其他内容。""",
+        },
+        {
             "label": "经济与建筑",
             "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（48小时内），每个主题搜一次：
 1. UAE construction project contract awarded 2026
-2. Dubai Abu Dhabi infrastructure development news
-3. China Middle East investment cooperation project
-4. OPEC oil output UAE Saudi decision
-5. RMB yuan Middle East trade settlement
+2. Dubai Abu Dhabi major infrastructure development
+3. China Middle East investment cooperation BRI project
+4. OPEC oil production quota UAE Saudi
+5. RMB yuan Middle East trade settlement CIPS
 
 搜索后整理为JSON数组，每条格式：
 {{"source":"来源网站","title":"标题（翻译成中文）","summary":"2-3句摘要（中文）"}}
 
 只输出JSON数组，不要其他内容。""",
         },
+        {
+            "label": "房产市场",
+            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（48小时内），每个主题搜一次：
+1. Dubai real estate market transactions Property Finder Bayut report
+2. Dubai Abu Dhabi property price sales volume latest
+3. Dubai off-plan property launch new project
+4. UAE real estate investment foreign buyer trend
+5. Dubai rental market apartment villa price
+
+搜索后整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（翻译成中文）","summary":"2-3句摘要（中文），包含具体数据如成交量、均价、涨跌幅"}}
+
+只输出JSON数组，不要其他内容。""",
+        },
     ]
+
+    # 月初月底额外搜本地油价
+    if _is_month_start or _is_month_end:
+        _month_label = _today.strftime("%B %Y")
+        search_rounds.append({
+            "label": "本地油价",
+            "prompt": f"""今天是{date_str}。请搜索UAE本地油价最新公告：
+1. UAE petrol diesel fuel price {_month_label} ENOC ADNOC
+2. UAE fuel price announcement next month
+
+搜索后整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（翻译成中文）","summary":"说明Special 95、E Plus 91、柴油的具体价格（AED/升）"}}
+
+只输出JSON数组，不要其他内容。""",
+        })
 
     all_articles = []
 
@@ -738,7 +787,7 @@ def upload_audio_to_github(filepath: str) -> str:
 
 # ── 第五步：发送到WhatsApp ────────────────────────────────────
 
-def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file):
+def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file, market_data=""):
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID") or config.TWILIO_ACCOUNT_SID
     auth_token  = os.environ.get("TWILIO_AUTH_TOKEN")  or config.TWILIO_AUTH_TOKEN
     recipients  = config.WHATSAPP_RECIPIENTS
@@ -754,19 +803,82 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
         log(f"  ⚠️ 上传失败: {e}")
         audio_url = None
 
+    # 时间问候（迪拜时间 UTC+4）
+    import datetime as _dt
+    _hour = (_dt.datetime.utcnow().hour + 4) % 24
+    if 6 <= _hour < 11:
+        _greeting = "早上好"
+    elif 17 <= _hour < 21:
+        _greeting = "下班了"
+    else:
+        _greeting = "大家好"
+
+    # 生成结构化文字摘要（数字板块格式）
+    def build_text_summary(broadcast_text: str, market_data: str) -> str:
+        """
+        让 Claude 把播报稿转成数字板块格式的文字摘要。
+        """
+        import anthropic as _anthropic
+        _client = _anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        _resp = _client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": f"""把以下播报稿整理成结构化文字摘要，用于WhatsApp消息。
+
+格式严格如下（有内容的板块才列，没有跳过）：
+1. 宏观热点
+1.1 [一句话说一条新闻]
+1.2 [一句话说一条新闻]
+
+2. 海湾地缘
+2.1 [一句话]
+
+3. 市场行情
+3.1 布伦特原油 XX.X ↑/↓X.X%
+3.2 现货金价 X,XXX ↑/↓X.X%
+3.3 美元指数 XXX.X ↑/↓X.X%
+3.4 DFM指数 X,XXX ↑/↓X.X%
+3.5 Emaar X.XX ↑/↓X.X%
+3.6 Aldar X.XX ↑/↓X.X%
+3.7 ALEC X.XX ↑/↓X.X%
+
+4. 政策与监管
+4.1 [一句话]
+
+5. 海湾动态
+5.1 [一句话]
+
+6. 房产与建筑
+6.1 [一句话，包含具体数据]
+
+规则：
+- 每条一句话，简洁，包含关键数字
+- 行情数据直接从下方提供的数据里取，不要从播报稿推断
+- 数据异常标注的项直接跳过
+- 只输出摘要内容，不要任何其他文字
+
+播报稿：
+{broadcast_text[:3000]}
+
+行情数据：
+{market_data}"""}],
+        )
+        return _resp.content[0].text.strip()
+
+    summary_text = build_text_summary(broadcast_text, market_data)
+
     for recipient in recipients:
         try:
-            # 消息1：文字正文（播报稿前500字）
-            preview_body = broadcast_text[:500].rstrip()
-            if len(broadcast_text) > 500:
-                preview_body += "……"
+            now = datetime.datetime.now()
+            date_short = now.strftime("%-m月%-d日")
 
             text_msg = (
-                f"🔵 *小蓝人播报* · {date}\n"
+                f"🔵 *小蓝人播报* · {date_short}\n"
+                f"{_greeting}，以下是今日中东投研播报：\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"{preview_body}\n"
+                f"{summary_text}\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"👇 语音版点击下方收听"
+                f"👇 完整语音版"
             )
             client.messages.create(from_=from_num, to=recipient, body=text_msg)
             time.sleep(2)
@@ -775,7 +887,7 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
             if audio_url:
                 client.messages.create(
                     from_=from_num, to=recipient,
-                    body="🎙️ 小蓝人语音播报（预告+全文）",
+                    body="🎙️ 小蓝人语音播报",
                     media_url=[audio_url],
                 )
                 time.sleep(1)
@@ -820,7 +932,7 @@ def main():
         save_memory(summary)
 
         log("📱 发送WhatsApp消息...")
-        send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file)
+        send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadcast_file, market_data)
 
         elapsed = int(time.time() - start)
         log("=" * 50)
