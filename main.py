@@ -110,69 +110,72 @@ def fetch_market_data() -> str:
     拉取两类数据：
     A. 大宗商品 + 宏观：布伦特原油、金价、美元指数
     B. UAE市场：DFM指数、DFM房地产指数、Emaar、Aldar、ALEC
-    返回格式化字符串直接塞进播报稿提示词。
-    任何单项失败只记录警告，不影响主流程。
+    涨跌幅超过±10%标记为数据异常。
     """
     log("📊 拉取实时行情数据...")
     try:
         import yfinance as yf
 
-        # A. 大宗商品 & 宏观（国际市场，USD）
         commodities = {
-            "布伦特原油(USD/桶)": "BZ=F",
-            "现货金价(USD/盎司)":  "GC=F",
-            "美元指数":            "DX-Y.NYB",
+            "布伦特原油(USD/桶)": ["BZ=F", "BZ=F"],
+            "现货金价(USD/盎司)":  ["GC=F", "GLD"],
+            "美元指数":            ["DX-Y.NYB", "UUP"],   # 备用：UUP ETF
         }
 
-        # B. UAE本地市场（AED，DFM/ADX）
         uae_stocks = {
-            "DFM综合指数":      "DFMGI.AE",
-            "DFM房地产指数":    "DFMREI.AE",
-            "Emaar(AED)":       "EMAAR.AE",
-            "Aldar(AED)":       "ALDAR.AE",
-            "ALEC建筑(AED)":    "ALEC.AE",
+            "DFM综合指数":   ["DFMGI.AE"],
+            "DFM房地产指数": ["DFMREI.AE"],
+            "Emaar(AED)":    ["EMAAR.AE"],
+            "Aldar(AED)":    ["ALDAR.AE", "ALDAR.DU"],   # 备用代码
+            "ALEC建筑(AED)": ["ALEC.AE"],
         }
 
-        def get_quote(symbol: str, decimals: int = 2) -> str:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="5d", interval="1d")
-            # 过滤掉成交量为0的非交易日
-            hist = hist[hist["Volume"] > 0] if "Volume" in hist.columns else hist
-            if hist.empty:
-                return "数据暂缺"
-            price = hist["Close"].iloc[-1]
-            if len(hist) >= 2:
-                prev  = hist["Close"].iloc[-2]
-                chg   = price - prev
-                pct   = chg / prev * 100
-                arrow = "↑" if chg >= 0 else "↓"
-                return f"{price:.{decimals}f}  {arrow}{abs(chg):.{decimals}f}（{pct:+.2f}%）"
-            return f"{price:.{decimals}f}"
+        def get_quote(symbols: list, decimals: int = 2) -> str:
+            for symbol in symbols:
+                try:
+                    t = yf.Ticker(symbol)
+                    hist = t.history(period="5d", interval="1d")
+                    if "Volume" in hist.columns:
+                        hist = hist[hist["Volume"] >= 0]  # 保留成交量0的数据（指数无成交量）
+                    hist = hist.dropna(subset=["Close"])
+                    if hist.empty:
+                        continue
+                    price = hist["Close"].iloc[-1]
+                    if price <= 0:
+                        continue
+                    if len(hist) >= 2:
+                        prev = hist["Close"].iloc[-2]
+                        if prev <= 0:
+                            return f"{price:.{decimals}f}"
+                        chg  = price - prev
+                        pct  = chg / prev * 100
+                        # 涨跌超10%标记异常
+                        if abs(pct) > 10:
+                            return f"{price:.{decimals}f}（数据异常{pct:+.1f}%，请核实）"
+                        arrow = "↑" if chg >= 0 else "↓"
+                        return f"{price:.{decimals}f}  {arrow}{abs(chg):.{decimals}f}（{pct:+.2f}%）"
+                    return f"{price:.{decimals}f}"
+                except Exception:
+                    continue
+            return "暂缺"
 
         sections = []
 
-        # A 部分
         a_lines = ["【大宗商品与宏观】"]
-        for name, symbol in commodities.items():
-            try:
-                a_lines.append(f"  {name}：{get_quote(symbol)}")
-            except Exception as e:
-                a_lines.append(f"  {name}：获取失败")
+        for name, symbols in commodities.items():
+            result = get_quote(symbols)
+            a_lines.append(f"  {name}：{result}")
         sections.append("\n".join(a_lines))
 
-        # B 部分
         b_lines = ["【UAE市场】"]
-        for name, symbol in uae_stocks.items():
-            try:
-                # 指数用整数显示，股票用2位小数
-                dec = 0 if "指数" in name else 2
-                b_lines.append(f"  {name}：{get_quote(symbol, dec)}")
-            except Exception as e:
-                b_lines.append(f"  {name}：获取失败")
+        for name, symbols in uae_stocks.items():
+            dec = 0 if "指数" in name else 2
+            result = get_quote(symbols, dec)
+            b_lines.append(f"  {name}：{result}")
         sections.append("\n".join(b_lines))
 
         result = "\n\n".join(sections)
-        log("  ✓ 行情数据拉取完成")
+        log("  ✓ 行情数据：")
         for line in result.split("\n"):
             if line.strip():
                 log(f"    {line.strip()}")
@@ -204,29 +207,29 @@ def web_search_news(date_str: str) -> list:
     search_rounds = [
         {
             "label": "地缘安全",
-            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（24小时内），每个主题搜一次：
-1. Middle East geopolitics today {date_str[:4]}
-2. Strait of Hormuz Iran latest news
-3. Israel Gaza Lebanon latest
-4. Houthi Red Sea shipping attack
-5. Saudi Arabia UAE diplomacy
+            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（48小时内），每个主题搜一次：
+1. Iran US nuclear deal sanctions latest news
+2. Iran Gulf Strait of Hormuz tension
+3. Israel Gaza Lebanon war update
+4. Houthi Red Sea attack shipping
+5. Saudi Arabia Iran UAE relations
 
-搜索后，将结果整理为JSON数组，每条格式：
-{{"source":"来源网站","title":"标题（中文翻译）","summary":"2-3句内容摘要（中文）"}}
+搜索后整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（翻译成中文）","summary":"2-3句摘要（中文），重点说对海湾局势的影响"}}
 
 只输出JSON数组，不要其他内容。""",
         },
         {
             "label": "经济与建筑",
-            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（24小时内），每个主题搜一次：
-1. UAE economy construction news today
-2. Dubai Abu Dhabi major project contract awarded
-3. China Middle East investment Belt Road {date_str[:4]}
-4. OPEC oil production UAE
-5. RMB yuan settlement Middle East China
+            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（48小时内），每个主题搜一次：
+1. UAE construction project contract awarded 2026
+2. Dubai Abu Dhabi infrastructure development news
+3. China Middle East investment cooperation project
+4. OPEC oil output UAE Saudi decision
+5. RMB yuan Middle East trade settlement
 
-搜索后，将结果整理为JSON数组，每条格式：
-{{"source":"来源网站","title":"标题（中文翻译）","summary":"2-3句内容摘要（中文）"}}
+搜索后整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（翻译成中文）","summary":"2-3句摘要（中文）"}}
 
 只输出JSON数组，不要其他内容。""",
         },
@@ -314,12 +317,20 @@ def generate_scripts(articles: list, market_data: str = "", search_articles: lis
         news_data_full = "（今日无新闻数据，请在各板块按实际情况播报无动态）"
 
     log("🤖 Claude正在生成今日预告（一句话）...")
+
+    # 在Python里算好时长，不靠Claude估
+    # 每条新闻约1分钟，行情固定1分钟，结尾固定1分钟
+    estimated_minutes = max(3, round(len(all_articles) * 1 + 2))
+
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=100,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": PREVIEW_PROMPT.format(
-            date=date, count=len(all_articles), news_list=news_list_short,
+            date=date,
+            count=len(all_articles),
+            estimated_minutes=estimated_minutes,
+            news_list=news_list_short,
         )}],
     )
     preview_text = resp.content[0].text.strip()
