@@ -186,23 +186,132 @@ def fetch_market_data() -> str:
         return f"（行情数据获取失败：{e}）"
 
 
-# ── 第二步：生成播报稿 ────────────────────────────────────────
+# ── 第一步c：Claude网络搜索补充新闻 ─────────────────────────
 
-def generate_scripts(articles: list, market_data: str = "") -> tuple:
+def web_search_news(date_str: str) -> list:
+    """
+    用 Anthropic web_search 工具分两轮搜索：
+    第一轮：海湾地缘安全（优先级最高）
+    第二轮：经济/建筑/中国中东
+    返回文章列表，格式与 fetch_news() 一致，方便合并。
+    """
+    log("🌐 Claude网络搜索补充新闻...")
+
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+
+    search_rounds = [
+        {
+            "label": "地缘安全",
+            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（24小时内），每个主题搜一次：
+1. Middle East geopolitics today {date_str[:4]}
+2. Strait of Hormuz Iran latest news
+3. Israel Gaza Lebanon latest
+4. Houthi Red Sea shipping attack
+5. Saudi Arabia UAE diplomacy
+
+搜索后，将结果整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（中文翻译）","summary":"2-3句内容摘要（中文）"}}
+
+只输出JSON数组，不要其他内容。""",
+        },
+        {
+            "label": "经济与建筑",
+            "prompt": f"""今天是{date_str}。请搜索以下主题的最新新闻（24小时内），每个主题搜一次：
+1. UAE economy construction news today
+2. Dubai Abu Dhabi major project contract awarded
+3. China Middle East investment Belt Road {date_str[:4]}
+4. OPEC oil production UAE
+5. RMB yuan settlement Middle East China
+
+搜索后，将结果整理为JSON数组，每条格式：
+{{"source":"来源网站","title":"标题（中文翻译）","summary":"2-3句内容摘要（中文）"}}
+
+只输出JSON数组，不要其他内容。""",
+        },
+    ]
+
+    all_articles = []
+
+    for round_info in search_rounds:
+        label = round_info["label"]
+        try:
+            log(f"  🔍 搜索：{label}...")
+            resp = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2000,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": round_info["prompt"]}],
+            )
+
+            # 提取最终文本回复（跳过 tool_use / tool_result block）
+            text_output = ""
+            for block in resp.content:
+                if hasattr(block, "text"):
+                    text_output += block.text
+
+            # 解析 JSON
+            import re, json
+            json_match = re.search(r"\[.*\]", text_output, re.DOTALL)
+            if json_match:
+                items = json.loads(json_match.group())
+                for item in items:
+                    if item.get("title"):
+                        all_articles.append({
+                            "source": f"网络搜索·{item.get('source', label)}",
+                            "title":  item.get("title", ""),
+                            "summary": item.get("summary", "")[:500],
+                            "link":   "",
+                        })
+                log(f"  ✓ {label}：找到 {len(items)} 条")
+            else:
+                log(f"  ⚠ {label}：未找到JSON，跳过")
+
+        except Exception as e:
+            log(f"  ⚠ {label} 搜索失败：{e}")
+
+    log(f"🌐 网络搜索共补充 {len(all_articles)} 条新闻")
+
+    # 保存搜索结果到日志文件，方便排查
+    try:
+        ensure_output_dir()
+        date_tag = datetime.date.today().strftime("%Y%m%d")
+        search_log = f"{config.OUTPUT_DIR}/search_{date_tag}.json"
+        with open(search_log, "w", encoding="utf-8") as f:
+            json.dump(all_articles, f, ensure_ascii=False, indent=2)
+        log(f"  💾 搜索结果已保存：{search_log}")
+    except Exception:
+        pass
+
+    return all_articles
+
+
+
+def generate_scripts(articles: list, market_data: str = "", search_articles: list = None) -> tuple:
     client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
     date = today_str()
 
-    # 无新闻时也能生成（Claude会播报无动态版本）
-    if articles:
+    # 合并 RSS + 网络搜索，去重（按标题）
+    all_articles = list(articles)
+    if search_articles:
+        existing_titles = {a["title"] for a in all_articles}
+        for a in search_articles:
+            if a["title"] not in existing_titles:
+                all_articles.append(a)
+                existing_titles.add(a["title"])
+    log(f"  📋 合并后共 {len(all_articles)} 条新闻（RSS {len(articles)} + 搜索 {len(search_articles or [])}）")
+
+    if all_articles:
         news_list_short = "\n".join(
-            f"{i+1}. 【{a['source']}】{a['title']}" for i, a in enumerate(articles)
+            f"{i+1}. 【{a['source']}】{a['title']}" for i, a in enumerate(all_articles)
         )
         news_data_full = "\n\n".join(
-            f"来源：{a['source']}\n标题：{a['title']}\n摘要：{a['summary']}" for a in articles
+            f"来源：{a['source']}\n标题：{a['title']}\n摘要：{a['summary']}" for a in all_articles
         )
     else:
-        news_list_short = "（今日RSS无新闻数据）"
-        news_data_full = "（今日RSS无新闻数据，请在各板块按实际情况播报无动态）"
+        news_list_short = "（今日无新闻数据）"
+        news_data_full = "（今日无新闻数据，请在各板块按实际情况播报无动态）"
 
     log("🤖 Claude正在生成今日预告（一句话）...")
     resp = client.messages.create(
@@ -210,7 +319,7 @@ def generate_scripts(articles: list, market_data: str = "") -> tuple:
         max_tokens=100,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": PREVIEW_PROMPT.format(
-            date=date, count=len(articles), news_list=news_list_short,
+            date=date, count=len(all_articles), news_list=news_list_short,
         )}],
     )
     preview_text = resp.content[0].text.strip()
@@ -496,16 +605,19 @@ def main():
         articles = fetch_news()
         # 无新闻也继续，Claude会播报各板块无动态
 
+        search_articles = web_search_news(today_str())
         market_data = fetch_market_data()
-        preview_text, broadcast_text = generate_scripts(articles, market_data)
+        preview_text, broadcast_text = generate_scripts(articles, market_data, search_articles)
 
         ensure_output_dir()
         date_tag = datetime.date.today().strftime("%Y%m%d")
         with open(f"{config.OUTPUT_DIR}/script_{date_tag}.txt", "w", encoding="utf-8") as f:
-            f.write("=== 今日预告 ===\n\n")
-            f.write(preview_text)
-            f.write("\n\n=== 完整播报稿 ===\n\n")
-            f.write(broadcast_text)
+            f.write(f"=== 今日预告 ===\n\n{preview_text}\n\n")
+            f.write(f"=== 完整播报稿 ===\n\n{broadcast_text}\n\n")
+            f.write(f"=== 数据来源 ===\n\n")
+            f.write(f"RSS新闻：{len(articles)}条\n")
+            f.write(f"网络搜索：{len(search_articles)}条\n")
+            f.write(f"行情数据：\n{market_data}\n")
         log("💾 文本备份已保存")
 
         preview_file, broadcast_file = synthesize_audio(preview_text, broadcast_text)
