@@ -249,13 +249,71 @@ def text_to_speech(text: str, filename: str) -> str:
     log(f"  ✓ 语音文件：{filepath}（{size_kb} KB）")
     return filepath
 
+def mix_lofi_background(speech_path: str, output_path: str) -> str:
+    """
+    将 lo-fi 背景音乐与语音混合。
+    背景音乐降至 -18 dB，循环填满语音时长，淡入淡出 3 秒。
+    返回混音后文件路径。
+    """
+    try:
+        from pydub import AudioSegment
+
+        log("🎵 混入 lo-fi 背景音乐...")
+        speech = AudioSegment.from_mp3(speech_path)
+        duration_ms = len(speech)
+
+        # 背景音乐文件路径（优先用本地缓存）
+        lofi_local = os.path.join(config.OUTPUT_DIR, "lofi_bg.mp3")
+        if not os.path.exists(lofi_local):
+            # 下载免版权 lo-fi 片段（~60s, ~1MB）
+            lofi_url = (
+                "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+            )
+            log(f"  ↓ 下载背景音乐：{lofi_url}")
+            r = requests.get(lofi_url, timeout=60)
+            r.raise_for_status()
+            with open(lofi_local, "wb") as f:
+                f.write(r.content)
+            log(f"  ✓ 背景音乐已缓存：{lofi_local}")
+
+        bg = AudioSegment.from_mp3(lofi_local)
+
+        # 循环背景音到语音时长
+        loops = (duration_ms // len(bg)) + 2
+        bg_loop = (bg * loops)[:duration_ms]
+
+        # 降低背景音量 -18 dB，淡入淡出 3 秒
+        fade_ms = 3000
+        bg_quiet = bg_loop - 18
+        bg_quiet = bg_quiet.fade_in(fade_ms).fade_out(fade_ms)
+
+        # 叠加
+        mixed = speech.overlay(bg_quiet)
+        mixed.export(output_path, format="mp3", bitrate="128k")
+        size_kb = os.path.getsize(output_path) // 1024
+        log(f"  ✓ 混音完成：{output_path}（{size_kb} KB）")
+        return output_path
+
+    except ImportError:
+        log("  ⚠️ pydub 未安装，跳过背景音乐（pip install pydub）")
+        return speech_path
+    except Exception as e:
+        log(f"  ⚠️ 背景音乐混音失败，使用原始语音：{e}")
+        return speech_path
+
+
 def synthesize_audio(preview_text: str, broadcast_text: str) -> tuple:
     ensure_output_dir()
     date_tag = datetime.date.today().strftime("%Y%m%d")
     # 合并预告和正文为一个语音文件
     combined_text = preview_text + "\n\n" + broadcast_text
-    combined_file = text_to_speech(combined_text, f"xiaolan_broadcast_{date_tag}.mp3")
-    # preview_file和broadcast_file都返回同一个文件
+    raw_file = text_to_speech(combined_text, f"xiaolan_broadcast_raw_{date_tag}.mp3")
+
+    # 混入 lo-fi 背景音乐
+    mixed_path = os.path.join(config.OUTPUT_DIR, f"xiaolan_broadcast_{date_tag}.mp3")
+    combined_file = mix_lofi_background(raw_file, mixed_path)
+
+    # preview_file 和 broadcast_file 都返回同一个混音文件
     return combined_file, combined_file
 
 # ── 第四步：上传音频 ──────────────────────────────────────────
@@ -334,73 +392,51 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
         f"👇 语音版：先听预告，再听全文"
     )
 
-    # 上传音频到 GitHub Releases（稳定可靠，不需要第三方）
-    def github_upload(fpath):
-        import base64, hashlib
-        fname = os.path.basename(fpath)
-        gh_token = os.environ.get("GITHUB_TOKEN","")
-        gh_repo  = os.environ.get("GITHUB_REPOSITORY","")
-        
-        # 用GitHub API上传到release
-        # 先获取或创建release
-        headers = {
-            "Authorization": f"token {gh_token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        tag = f"audio-{datetime.date.today().strftime('%Y%m%d')}"
-        
-        # 创建release
-        rel_resp = requests.post(
-            f"https://api.github.com/repos/{gh_repo}/releases",
-            headers=headers,
-            json={"tag_name": tag, "name": f"播报音频 {tag}", "draft": False, "prerelease": False},
-            timeout=30,
-        )
-        if rel_resp.status_code == 422:
-            # release已存在，获取它
-            rel_resp = requests.get(
-                f"https://api.github.com/repos/{gh_repo}/releases/tags/{tag}",
-                headers=headers, timeout=30,
-            )
-        rel_data = rel_resp.json()
-        upload_url = rel_data.get("upload_url","").replace("{?name,label}","")
-        rel_id = rel_data.get("id","")
-        
-        # 删除同名旧asset
-        assets_resp = requests.get(
-            f"https://api.github.com/repos/{gh_repo}/releases/{rel_id}/assets",
-            headers=headers, timeout=30,
-        )
-        for asset in assets_resp.json():
-            if asset.get("name") == fname:
-                requests.delete(
-                    f"https://api.github.com/repos/{gh_repo}/releases/assets/{asset['id']}",
-                    headers=headers, timeout=30,
-                )
-        
-        # 上传文件
+    # 上传音频到 Cloudinary（稳定直链，Twilio 可直接访问）
+    def cloudinary_upload(fpath):
+        import hashlib, hmac, time as _time
+        cloud_name  = os.environ.get("CLOUDINARY_CLOUD_NAME") or config.CLOUDINARY_CLOUD_NAME
+        api_key     = os.environ.get("CLOUDINARY_API_KEY")    or config.CLOUDINARY_API_KEY
+        api_secret  = os.environ.get("CLOUDINARY_API_SECRET") or config.CLOUDINARY_API_SECRET
+
+        if not cloud_name or not api_key or not api_secret:
+            raise RuntimeError("Cloudinary 凭证未配置，请设置 CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET")
+
+        fname       = os.path.splitext(os.path.basename(fpath))[0]
+        timestamp   = str(int(_time.time()))
+        public_id   = fname
+
+        # 生成签名
+        params_to_sign = f"public_id={public_id}&timestamp={timestamp}&resource_type=video"
+        sig = hashlib.sha1((params_to_sign + api_secret).encode()).hexdigest()
+
         with open(fpath, "rb") as f:
             up_resp = requests.post(
-                f"{upload_url}?name={fname}",
-                headers={**headers, "Content-Type": "audio/mpeg"},
-                data=f,
+                f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
+                data={
+                    "api_key":    api_key,
+                    "timestamp":  timestamp,
+                    "public_id":  public_id,
+                    "signature":  sig,
+                },
+                files={"file": (os.path.basename(fpath), f, "audio/mpeg")},
                 timeout=180,
             )
-        asset_data = up_resp.json()
-        url = asset_data.get("browser_download_url","")
+        up_resp.raise_for_status()
+        url = up_resp.json().get("secure_url", "")
         return url
 
-    log("  📤 上传预告音频到GitHub...")
+    log("  📤 上传预告音频到Cloudinary...")
     try:
-        preview_url = github_upload(preview_file)
+        preview_url = cloudinary_upload(preview_file)
         log(f"  ✓ 预告URL: {preview_url}")
     except Exception as e:
         log(f"  ⚠️ 上传失败: {e}")
         preview_url = None
 
-    log("  📤 上传正文音频到GitHub...")
+    log("  📤 上传正文音频到Cloudinary...")
     try:
-        broadcast_url = github_upload(broadcast_file)
+        broadcast_url = cloudinary_upload(broadcast_file)
         log(f"  ✓ 正文URL: {broadcast_url}")
     except Exception as e:
         log(f"  ⚠️ 上传失败: {e}")
@@ -408,21 +444,15 @@ def send_whatsapp_with_files(preview_text, broadcast_text, preview_file, broadca
 
     for recipient in recipients:
         try:
-            # 消息1：文字摘要
-            summary_lines = []
-            for line in broadcast_text.split("\n"):
-                line = line.strip()
-                if line.startswith("【") and "】" in line:
-                    summary_lines.append(line)
-                if len(summary_lines) >= 6:
-                    break
-            if not summary_lines:
-                summary_lines = [broadcast_text[:200] + "..."]
+            # 消息1：文字正文（播报稿前500字）
+            preview_body = broadcast_text[:500].rstrip()
+            if len(broadcast_text) > 500:
+                preview_body += "……"
 
             text_msg = (
                 f"🔵 *小蓝人播报* · {date}\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"{chr(10).join(summary_lines)}\n"
+                f"{preview_body}\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"👇 语音版：先听预告，再听全文"
             )
