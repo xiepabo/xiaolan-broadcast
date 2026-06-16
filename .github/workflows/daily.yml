@@ -11,18 +11,23 @@ permissions:
 jobs:
   broadcast:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要完整历史，后面要 push audio 分支
 
       - name: 配置Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 安装依赖
+      - name: 安装系统依赖（ffmpeg用于背景音乐混音）
+        run: sudo apt-get install -y ffmpeg
+
+      - name: 安装Python依赖
         run: pip install -r requirements.txt
 
       - name: 运行小蓝人播报
