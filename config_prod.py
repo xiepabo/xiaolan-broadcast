@@ -54,6 +54,18 @@ COMPANY_NAME         = "中建中东投资"
 
 OUTPUT_DIR = "output"
 
+# ── 背景音乐歌单（随机选一首，免版权）────────────────────────
+# 想换歌直接在这里加/删 URL，代码会自动缓存到 output/ 目录
+LOFI_PLAYLIST = [
+    # SoundHelix 免版权示例曲（风格各异，可按喜好删减）
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3",
+]
+
 # Cloudinary（免费媒体CDN，用于WhatsApp语音发送）
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
 CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY", "")
